@@ -18,3 +18,8 @@ def schedule(uav, env):
             schedule.append(("UPLOAD", -1))
     
     return schedule
+
+def allocate_power(task):
+    if task == "ISAC":
+        return 0.4
+    return 1.0
