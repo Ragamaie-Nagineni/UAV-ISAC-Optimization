@@ -40,3 +40,8 @@ def compute_radar_rate(uav, env, schedule_list):
             total_rate += rate(sinr)
     
     return total_rate  
+def update_trajectory(uav, env):
+    for q in range(uav.Q):
+        random_node = env.nodes[np.random.randint(env.num_nodes)]
+        direction = np.append(random_node, 100) - uav.position[q]
+        uav.position[q] += 0.05 * direction
