@@ -10,6 +10,7 @@ uav = UAV()
 uav.initialize_trajectory(env.data_center)
 
 # Iterative optimization
+trajectory_history = []
 for i in range(20):
     schedule_list = schedule(uav, env)
     
@@ -21,8 +22,8 @@ for i in range(20):
     rate = compute_radar_rate(uav, env, schedule_list)
     
     print(f"Iteration {i}, Radar Rate: {rate}")
-    
-    update_trajectory(uav, env)
+    update_trajectory(uav, env, schedule_list)
+    trajectory_history.append(uav.position.copy())
 
 # Visualization
-plot_trajectory(uav, env)
+plot_trajectory(trajectory_history, env)

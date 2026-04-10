@@ -49,8 +49,26 @@ def compute_radar_rate(uav, env, schedule_list):
     return total_rate
 
 
-def update_trajectory(uav, env):
-    for q in range(uav.Q):
-        random_node = env.nodes[np.random.randint(env.num_nodes)]
-        direction = np.append(random_node, 100) - uav.position[q]
-        uav.position[q] += 0.05 * direction
+def update_trajectory(uav, env, schedule_list):
+    for q in range(uav.Q - 1):   # IMPORTANT: Q-1
+        
+        task, k = schedule_list[q]
+        
+        if task == "ISAC":
+            target = env.nodes[k]
+        else:
+            target = env.data_center
+        
+        # Convert to 3D
+        target_3d = np.append(target, 100)
+        
+        # Direction vector
+        direction = target_3d - uav.position[q]
+        
+        step_size = 5
+        
+        # ✅ ADD THIS (your screenshot code)
+        direction = direction / (np.linalg.norm(direction) + 1e-6)
+        
+        # Move UAV (constant speed)
+        uav.position[q+1] = uav.position[q] + 20 * direction
