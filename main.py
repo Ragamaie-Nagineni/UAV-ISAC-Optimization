@@ -1,116 +1,114 @@
-from environment import Environment
-from uav import UAV
-from optimization import (
-    schedule,
-    allocate_power,
-    compute_radar_rate,
-    update_trajectory,
-    compute_metrics
-)
-from visualization import (
-    plot_all,
-    plot_trajectory,
-    plot_before_after,
-    plot_rate,
-    plot_schedule,
-    plot_power,
-    plot_speed,
-    plot_3d_trajectory
-)
+"""
+main.py
+=======
+Entry point for the UAV-ISAC optimisation simulation.
+
+Implements the system from:
+  Liu et al., "UAV Assisted Integrated Sensing and Communications for IoT:
+  3D Trajectory Optimization and Resource Allocation," IEEE TWC 2024.
+
+Workflow
+--------
+1. Initialise environment (IoT nodes + data-collection centre).
+2. Initialise UAV with circular baseline trajectory & equal power split.
+3. Run Algorithm 2 (three-layer iterative optimisation).
+4. Report results and generate all plots.
+"""
 
 import numpy as np
 
-
-# ------------------ INITIALIZATION ------------------
-env = Environment()
-uav = UAV()
-
-uav.initialize_trajectory(env.data_center)
-
-# Save initial state
-initial_trajectory = uav.position.copy()
-rates = []
-trajectory_history = []
-
-print("\n🚀 Starting UAV ISAC Optimization...\n")
-env.print_state()
-uav.print_state()
-
-
-# ------------------ ITERATIVE OPTIMIZATION ------------------
-for i in range(20):
-
-    # 🔥 Dynamic environment (nodes move)
-    env.update_nodes()
-
-    # Scheduling (must return Q length)
-    schedule_list = schedule(uav, env)
-
-    # SAFETY CHECK (IMPORTANT)
-    if len(schedule_list) != uav.Q:
-        print(f"⚠️ Fixing schedule length: {len(schedule_list)} → {uav.Q}")
-        while len(schedule_list) < uav.Q:
-            schedule_list.append(("UPLOAD", -1))
-
-    # Power allocation
-    for q in range(len(schedule_list)):   # ✅ FIXED
-        task, _ = schedule_list[q]
-        uav.alpha[q] = allocate_power(task)
-
-    # Compute radar rate
-    rate = compute_radar_rate(uav, env, schedule_list)
-    rates.append(rate)
-
-    # 🔥 Compute additional metrics
-    isac, upload, avg_dist, avg_alpha = compute_metrics(uav, env, schedule_list)
-
-    # 🔥 Rich console output
-    print(f"""
-🔹 Iteration {i}
-   Radar Rate        : {rate:.2f}
-   ISAC Tasks        : {isac}
-   Upload Tasks      : {upload}
-   Avg UAV-Node Dist : {avg_dist:.2f}
-   Avg Power (alpha) : {avg_alpha:.2f}
-""")
-
-    # Update UAV trajectory
-    update_trajectory(uav, env, schedule_list)
-
-    # Dynamic UAV behavior
-    uav.adjust_height()
-    uav.update_velocity()
-
-    # Store history
-    trajectory_history.append(uav.position.copy())
-
-initial_rate = compute_radar_rate(uav, env, schedule(uav, env))
-print(f"Initial Radar Rate: {initial_rate:.2f}")
-print(f"Final Radar Rate  : {rates[-1]:.2f}")
-# ------------------ FINAL VISUALIZATION ------------------
-
-print("\n📊 Generating Visualizations...\n")
-
-# 🔥 ALL-IN-ONE DASHBOARD
-plot_all(
-    trajectory_history,
-    env,
-    initial_trajectory,
-    uav.position,
-    rates,
-    schedule_list,
-    uav
+from environment import Environment
+from uav import UAV
+from optimization import three_layer_optimize, compute_total_radar_rate, _channel_gains, solve_scheduling
+from visualization import (
+    plot_3d_trajectory,
+    plot_top_view,
+    plot_convergence,
+    plot_scheduling,
+    plot_altitude,
+    plot_speed,
+    plot_power,
+    plot_dashboard,
 )
 
-# Optional individual plots
-plot_trajectory(trajectory_history, env)
-plot_before_after(initial_trajectory, uav.position, env)
-plot_rate(rates)
-plot_schedule(schedule_list)
-plot_power(uav)
-plot_speed(uav)
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. Setup
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ✅ FIXED: pass history, not uav
-plot_3d_trajectory(trajectory_history, env)
+print("=" * 60)
+print("  UAV-ISAC 3-D Trajectory Optimisation")
+print("  (Liu et al., IEEE TWC 2024)")
+print("=" * 60)
 
-print("\n✅ Simulation Complete!\n")
+env = Environment(num_nodes=12, area_size=1200, seed=42)
+uav = UAV(Q=200, T=100.0)           # Q=200 slots, T=100 s  (dt = 0.5 s)
+
+env.print_state()
+print()
+
+uav.initialize_trajectory(env)
+uav.print_state()
+print()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. Save initial state
+# ─────────────────────────────────────────────────────────────────────────────
+
+initial_position = uav.position.copy()
+initial_velocity = uav.velocity.copy()
+
+# Compute initial radar rate (with default power & scheduling)
+hk_com0, hk_rad0, hc0, _, _ = _channel_gains(uav, env)
+omega0, b0, _, _, _ = solve_scheduling(uav, env, hk_com0, hk_rad0, hc0)
+initial_rate = compute_total_radar_rate(uav, env, omega0)
+print(f"📶 Initial Sum Radar Estimation Rate : {initial_rate:.4f} bps/Hz")
+print()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. Run Algorithm 2
+# ─────────────────────────────────────────────────────────────────────────────
+
+print("🚀 Running three-layer iterative optimisation (Algorithm 2)...")
+print("-" * 60)
+
+rates, omega_hist = three_layer_optimize(
+    uav, env,
+    max_outer=20,
+    tol=1e-3,
+    verbose=True
+)
+
+print("-" * 60)
+final_rate = rates[-1]
+print(f"\n📶 Initial Sum Radar Estimation Rate : {initial_rate:.4f} bps/Hz")
+print(f"📶 Final   Sum Radar Estimation Rate : {final_rate:.4f} bps/Hz")
+gain = (final_rate - initial_rate) / (abs(initial_rate) + 1e-12) * 100
+print(f"📈 Improvement                       : {gain:+.1f}%")
+print()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. Final scheduling for plots
+# ─────────────────────────────────────────────────────────────────────────────
+
+omega_final = omega_hist[-1]
+hk_com_f, hk_rad_f, hc_f, _, _ = _channel_gains(uav, env)
+_, b_final, _, _, _ = solve_scheduling(uav, env, hk_com_f, hk_rad_f, hc_f)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. Visualisations
+# ─────────────────────────────────────────────────────────────────────────────
+
+print("📊 Generating plots...")
+
+plot_3d_trajectory(initial_position, uav.position, env, omega=omega_final)
+plot_top_view(initial_position, uav.position, env, omega=omega_final)
+plot_convergence(rates)
+plot_scheduling(omega_final, b_final, env)
+plot_altitude(initial_position, uav.position)
+plot_speed(initial_velocity, uav.velocity)
+plot_power(uav, omega_final, b_final)
+plot_dashboard(initial_position, uav.position, uav, env, rates, omega_final, b_final)
+
+print()
+print("✅ Simulation complete!  All plots saved to → output_plots/")
+print("=" * 60)
