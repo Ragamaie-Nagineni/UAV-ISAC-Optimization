@@ -43,11 +43,17 @@ for i in range(20):
     # 🔥 Dynamic environment (nodes move)
     env.update_nodes()
 
-    # Scheduling
+    # Scheduling (must return Q length)
     schedule_list = schedule(uav, env)
 
+    # SAFETY CHECK (IMPORTANT)
+    if len(schedule_list) != uav.Q:
+        print(f"⚠️ Fixing schedule length: {len(schedule_list)} → {uav.Q}")
+        while len(schedule_list) < uav.Q:
+            schedule_list.append(("UPLOAD", -1))
+
     # Power allocation
-    for q in range(uav.Q):
+    for q in range(len(schedule_list)):   # ✅ FIXED
         task, _ = schedule_list[q]
         uav.alpha[q] = allocate_power(task)
 
@@ -78,12 +84,14 @@ for i in range(20):
     # Store history
     trajectory_history.append(uav.position.copy())
 
-
+initial_rate = compute_radar_rate(uav, env, schedule(uav, env))
+print(f"Initial Radar Rate: {initial_rate:.2f}")
+print(f"Final Radar Rate  : {rates[-1]:.2f}")
 # ------------------ FINAL VISUALIZATION ------------------
 
 print("\n📊 Generating Visualizations...\n")
 
-# 🔥 ALL-IN-ONE DASHBOARD (BEST)
+# 🔥 ALL-IN-ONE DASHBOARD
 plot_all(
     trajectory_history,
     env,
@@ -94,13 +102,15 @@ plot_all(
     uav
 )
 
-# Optional individual plots (you can comment if not needed)
+# Optional individual plots
 plot_trajectory(trajectory_history, env)
 plot_before_after(initial_trajectory, uav.position, env)
 plot_rate(rates)
 plot_schedule(schedule_list)
 plot_power(uav)
 plot_speed(uav)
-plot_3d_trajectory(uav, env)
+
+# ✅ FIXED: pass history, not uav
+plot_3d_trajectory(trajectory_history, env)
 
 print("\n✅ Simulation Complete!\n")

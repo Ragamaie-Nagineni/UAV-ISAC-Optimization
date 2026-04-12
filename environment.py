@@ -12,11 +12,11 @@ class Environment:
         self.data_center = np.array([area_size / 2, area_size / 2])
     
     # ------------------  Dynamic Node Movement ------------------
-    def update_nodes(self, step_size=5):
+    def update_nodes(self, step_size=2):
         """
         Slightly move nodes to simulate dynamic IoT environment
         """
-        movement = np.random.randn(self.num_nodes, 2) * step_size
+        movement = np.random.randn(self.num_nodes, 2) * 1
         self.nodes += movement
         
         # Keep nodes inside area bounds

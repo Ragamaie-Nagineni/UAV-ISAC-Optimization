@@ -1,5 +1,6 @@
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
+import numpy as np
 
 
 # ------------------ 1. TRAJECTORY EVOLUTION ------------------
@@ -61,7 +62,11 @@ def plot_schedule(schedule_list):
     indices = []
 
     for task, k in schedule_list:
-        indices.append(k if task == "ISAC" else -1)
+        #indices.append(k if task == "ISAC" else -1)
+        if task == "ISAC":
+          indices.append(1)
+        else:
+          indices.append(0)
 
     plt.figure(figsize=(6,5))
     plt.bar(range(len(indices)), indices)
@@ -106,15 +111,23 @@ def plot_speed(uav):
 
 
 # ------------------ 7. 3D TRAJECTORY (BIG UPGRADE) ------------------
-def plot_3d_trajectory(uav, env):
-    fig = plt.figure(figsize=(7,6))
+from mpl_toolkits.mplot3d import Axes3D
+
+def plot_3d_trajectory(history, env):
+    fig = plt.figure()
     ax = fig.add_subplot(111, projection='3d')
 
-    # UAV path
-    ax.plot(uav.position[:,0], uav.position[:,1], uav.position[:,2], label='UAV Path')
+    # plot nodes
+    ax.scatter(env.nodes[:,0], env.nodes[:,1], np.zeros(len(env.nodes)),
+               c='red', label='Nodes')
 
-    # Nodes
-    ax.scatter(env.nodes[:,0], env.nodes[:,1], 0, c='red', label='Nodes')
+    # 🔥 plot all iterations (faded)
+    for pos in history:
+        ax.plot(pos[:,0], pos[:,1], pos[:,2], alpha=0.2)
+
+    # 🔥 highlight final trajectory
+    final = history[-1]
+    ax.plot(final[:,0], final[:,1], final[:,2], linewidth=3, label='Final Path')
 
     ax.set_title("3D UAV Trajectory")
     ax.set_xlabel("X")
@@ -122,7 +135,6 @@ def plot_3d_trajectory(uav, env):
     ax.set_zlabel("Height")
 
     ax.legend()
-    plt.tight_layout()
     plt.show()
 
 
