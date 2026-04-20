@@ -19,7 +19,7 @@ import numpy as np
 
 from environment import Environment
 from uav import UAV
-from optimization import three_layer_optimize, compute_total_radar_rate, _channel_gains, solve_scheduling
+from optimization_baseline import three_layer_optimize, compute_total_radar_rate, _channel_gains, solve_scheduling
 from visualization import (
     plot_3d_trajectory,
     plot_top_view,
