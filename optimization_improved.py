@@ -224,6 +224,14 @@ def solve_power_multiobjective(uav, env, omega, b, hk_com, hk_rad, hc,
 
     for _ in range(max_iter):
 
+        # FIX 2: Normalise energy to the same order of magnitude as radar
+        # rate. Without this, energy (≈ Q * P_AVG * dt ≈ 100 J) completely
+        # dominates the radar rate (≈ 5–20 bps/Hz) for any lam < 1,
+        # making the trade-off weight λ effectively binary (0 vs 1).
+        # We divide energy by its natural scale (Q * P_AVG * dt) so both
+        # objectives live in a comparable range [0, 1] × scale.
+        energy_scale = Q * uav.P_AVG * dt  # reference energy (full budget)
+
         # ── Optimise alpha (Pt fixed) ──────────────────────────────────────
         def neg_obj_alpha(a_vec):
             radar_val = 0.0
@@ -237,7 +245,7 @@ def solve_power_multiobjective(uav, env, omega, b, hk_com, hk_rad, hc,
                     rc      = comm_rate(sinr_com(Pc, Pr, hk_com[q, k]))
                     penalty = max(0.0, rr - rc) * 1e3
                     radar_val += rr - penalty
-            energy_val = np.sum(Pt_cur) * dt
+            energy_val = np.sum(Pt_cur) * dt / energy_scale  # normalised
             return -(lam * radar_val - (1 - lam) * energy_val)
 
         res_a     = minimize(neg_obj_alpha, alpha_cur,
@@ -259,7 +267,7 @@ def solve_power_multiobjective(uav, env, omega, b, hk_com, hk_rad, hc,
                     rc      = comm_rate(sinr_com(Pc, Pr, hk_com[q, k]))
                     penalty = max(0.0, rr - rc) * 1e3
                     radar_val += rr - penalty
-            energy_val = np.sum(pt_vec) * dt
+            energy_val = np.sum(pt_vec) * dt / energy_scale  # normalised
             avg_excess = max(0.0, np.mean(pt_vec) - uav.P_AVG) * 1e4
             return -(lam * radar_val - (1 - lam) * energy_val - avg_excess)
 
@@ -268,8 +276,19 @@ def solve_power_multiobjective(uav, env, omega, b, hk_com, hk_rad, hc,
                           bounds=[(0.0, 5 * uav.P_AVG)] * Q,
                           options={"maxiter": 200, "ftol": 1e-10})
         Pt_new = np.clip(res_p.x, 0.0, 5 * uav.P_AVG)
-        # Rescale so average power equals P_AVG (power budget)
-        Pt_new = Pt_new * uav.P_AVG / (np.mean(Pt_new) + 1e-12)
+        # FIX 1: Only rescale when lam ≈ 1 (pure radar maximisation).
+        # When lam < 1, the energy term in the objective already drives Pt
+        # downward; forcing a rescale to P_AVG destroys that signal and makes
+        # the improved solver identical to the baseline.
+        if lam > 0.999:
+            # Baseline-compatible: normalise to average power budget
+            Pt_new = Pt_new * uav.P_AVG / (np.mean(Pt_new) + 1e-12)
+        else:
+            # Pareto mode: cap at P_AVG on average (soft budget), but allow
+            # the optimiser to settle wherever the trade-off lands.
+            cur_avg = np.mean(Pt_new)
+            if cur_avg > uav.P_AVG:
+                Pt_new = Pt_new * uav.P_AVG / cur_avg  # only scale DOWN
 
         converged = (np.max(np.abs(alpha_new - alpha_cur)) < tol and
                      np.max(np.abs(Pt_new    - Pt_cur))   < tol)
@@ -287,10 +306,17 @@ def solve_power_multiobjective(uav, env, omega, b, hk_com, hk_rad, hc,
 # Sub-problem 3: 3-D trajectory optimisation  (identical structure to baseline)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _smooth_trajectory(pos_targets, uav, env, omega, b):
+def _smooth_trajectory(pos_targets, uav, env, omega, b, node_service=None, R_min=0.5):
     Q  = uav.Q
     dt = uav.dt
     pos = pos_targets.copy()
+
+    # FIX 4: Fairness-aware waypoints — fly lower over under-served nodes to
+    # boost their radar channel gain (h_rad ∝ d^-4), which is the main lever
+    # the trajectory has. Without this, the improved trajectory is identical
+    # to the baseline (same BLEND, same altitude logic).
+    if node_service is None:
+        node_service = np.zeros(env.num_nodes)
 
     desired = np.zeros((Q, 3))
     for q in range(Q):
@@ -298,7 +324,11 @@ def _smooth_trajectory(pos_targets, uav, env, omega, b):
             k = int(np.argmax(omega[q]))
             desired[q, 0] = env.nodes[k, 0]
             desired[q, 1] = env.nodes[k, 1]
-            desired[q, 2] = uav.H_MIN + 10
+            # Under-served nodes → fly lower for better channel gain
+            deficit = max(0.0, R_min - node_service[k])
+            urgency = min(1.0, deficit / (R_min + 1e-9))   # 0=satisfied, 1=deprived
+            alt = uav.H_MIN + (1.0 - urgency) * 30         # [H_MIN, H_MIN+30]
+            desired[q, 2] = alt
         else:
             desired[q, 0] = env.data_center[0]
             desired[q, 1] = env.data_center[1]
@@ -340,14 +370,15 @@ def _trajectory_rate(pos, uav, env, omega):
     return total
 
 
-def solve_trajectory(uav, env, omega, b, tol=1e-4, max_iter=30):
+def solve_trajectory(uav, env, omega, b, node_service=None, R_min=0.5, tol=1e-4, max_iter=30):
     Q  = uav.Q
     dt = uav.dt
     pos      = uav.position.copy()
     prev_obj = _trajectory_rate(pos, uav, env, omega)
 
     for it in range(max_iter):
-        pos_new = _smooth_trajectory(pos, uav, env, omega, b)
+        pos_new = _smooth_trajectory(pos, uav, env, omega, b,
+                                     node_service=node_service, R_min=R_min)
         new_obj = _trajectory_rate(pos_new, uav, env, omega)
         if new_obj >= prev_obj - 1e-9:
             pos      = pos_new
@@ -429,7 +460,8 @@ def three_layer_optimize_improved(
             uav, env, omega, b, hk_com, hk_rad, hc, lam=lam)
 
         # ── Step 3: 3-D trajectory ─────────────────────────────────────────
-        solve_trajectory(uav, env, omega, b)
+        solve_trajectory(uav, env, omega, b,
+                         node_service=node_svc, R_min=R_min)
 
         # ── Evaluate ──────────────────────────────────────────────────────
         rate = compute_total_radar_rate(uav, env, omega)
@@ -446,11 +478,16 @@ def three_layer_optimize_improved(
                   f"  |  ISAC: {isac_cnt:3d}  Upload: {upload_cnt:3d}"
                   f"  |  Fair nodes: {fair_nodes}/{env.num_nodes}")
 
-        if abs(rate - prev_rate) < tol and i > 1:
+        # FIX 3: Converge on the scalarised composite objective, not just
+        # radar rate. Using radar rate alone causes lam<1 runs to stop
+        # before energy has meaningfully changed, producing identical curves.
+        energy_scale_conv = uav.Q * uav.P_AVG * uav.dt
+        composite = lam * rate - (1 - lam) * (energy / (energy_scale_conv + 1e-12))
+        if abs(composite - prev_rate) < tol and i > 1:
             if verbose:
                 print(f"  ✅ Converged at iteration {i+1}")
             break
-        prev_rate = rate
+        prev_rate = composite
 
     final_node_service = compute_per_node_rate(uav, env, omega_hist[-1])
     return rates, energies, omega_hist, final_node_service
