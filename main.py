@@ -45,12 +45,12 @@ from optimization_baseline import (
 from optimization_improved import (
     _channel_gains as _channel_gains_imp,
     solve_scheduling_fair,
+    solve_power_multiobjective,   # FIX: use the actual improved power solver
     solve_trajectory,
     compute_total_radar_rate as compute_rate_improved,
     compute_per_node_rate,
     compute_energy,
 )
-from optimization_baseline import solve_power   # reused in improved main loop
 
 from utils import h_rad, sinr_rad, radar_rate, distance_3d
 
@@ -160,7 +160,10 @@ plot_dashboard(initial_position_b, uav_b.position, uav_b, env,
 # SECTION 3 — IMPROVED (fairness + Pareto multi-objective)
 # ═════════════════════════════════════════════════════════════════════════════
 print("\n" + "─" * 65)
-print(f"  ② IMPROVED  —  Fairness (R_min={R_MIN}) + Pareto (λ=0.8)")
+LAM = 1.0   # Pareto weight: 1.0 = pure radar maximisation (best rate + fairness)
+            # Try 0.8 for a slight energy reduction at small rate cost
+
+print(f"  ② IMPROVED  —  Fairness (R_min={R_MIN}) + Pareto (λ={LAM})")
 print("─" * 65)
 
 uav_i = UAV(Q=200, T=100.0)
@@ -175,10 +178,14 @@ prev_rate  = -np.inf
 print()
 for i in range(20):
     hk_com, hk_rad, hc, _, _ = _channel_gains_imp(uav_i, env)
+    # FIX A: Use the actual improved fairness-aware scheduling
     omega_i, b_i, Rrad, Rcom, Rc, ns = solve_scheduling_fair(
         uav_i, env, hk_com, hk_rad, hc, R_min=R_MIN)
-    solve_power(uav_i, env, omega_i, b_i, hk_com, hk_rad, hc, max_iter=30)
-    solve_trajectory(uav_i, env, omega_i, b_i)
+    # FIX B: Use the actual improved multi-objective power solver (not baseline's)
+    solve_power_multiobjective(uav_i, env, omega_i, b_i, hk_com, hk_rad, hc,
+                               lam=LAM, max_iter=30)
+    # FIX C: Pass node_service so trajectory flies lower over deprived nodes
+    solve_trajectory(uav_i, env, omega_i, b_i, node_service=ns, R_min=R_MIN)
 
     rate_i   = compute_rate_improved(uav_i, env, omega_i)
     energy_i = compute_energy(uav_i)

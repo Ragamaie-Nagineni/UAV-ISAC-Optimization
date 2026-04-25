@@ -307,53 +307,69 @@ def solve_power_multiobjective(uav, env, omega, b, hk_com, hk_rad, hc,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _smooth_trajectory(pos_targets, uav, env, omega, b, node_service=None, R_min=0.5):
+    """
+    Per-slot independent waypoint nudge (no velocity-cascade).
+
+    Each ISAC slot is nudged independently toward its assigned node in XY.
+    Altitude is only lowered for genuinely deprived nodes (urgency > 0) to
+    improve h_rad ∝ d^{-4}; for satisfied nodes the altitude is untouched so
+    the existing cone footprint is preserved.  Each slot's step is capped at
+    STEP_XY / STEP_Z so the move is always feasible, but we do NOT propagate
+    clipping forward — that is what caused the cascade that pushed boundary
+    slots outside their node's cone in the original BLEND implementation.
+    Upload slots are nudged toward the data-centre.
+    """
     Q  = uav.Q
     dt = uav.dt
     pos = pos_targets.copy()
 
-    # FIX 4: Fairness-aware waypoints — fly lower over under-served nodes to
-    # boost their radar channel gain (h_rad ∝ d^-4), which is the main lever
-    # the trajectory has. Without this, the improved trajectory is identical
-    # to the baseline (same BLEND, same altitude logic).
     if node_service is None:
         node_service = np.zeros(env.num_nodes)
 
-    desired = np.zeros((Q, 3))
-    for q in range(Q):
-        if omega[q].sum() > 0.5:
-            k = int(np.argmax(omega[q]))
-            desired[q, 0] = env.nodes[k, 0]
-            desired[q, 1] = env.nodes[k, 1]
-            # Under-served nodes → fly lower for better channel gain
-            deficit = max(0.0, R_min - node_service[k])
-            urgency = min(1.0, deficit / (R_min + 1e-9))   # 0=satisfied, 1=deprived
-            alt = uav.H_MIN + (1.0 - urgency) * 30         # [H_MIN, H_MIN+30]
-            desired[q, 2] = alt
-        else:
-            desired[q, 0] = env.data_center[0]
-            desired[q, 1] = env.data_center[1]
-            desired[q, 2] = (uav.H_MIN + uav.H_MAX) / 2
+    max_step_xy = uav.V_XY_MAX * dt * 0.30   # 30 % of max speed per call
+    max_step_z  = uav.V_Z_MAX  * dt * 0.30
 
     new_pos = pos.copy()
-    BLEND   = 0.30
+    tan2    = np.tan(uav.THETA) ** 2
 
     for q in range(Q):
-        new_pos[q] = pos[q] + BLEND * (desired[q] - pos[q])
+        if omega[q].sum() > 0.5:
+            k  = int(np.argmax(omega[q]))
+            xk, yk = env.nodes[k]
 
-    max_step_xy = uav.V_XY_MAX * dt
-    max_step_z  = uav.V_Z_MAX  * dt
+            # ── XY nudge: move toward assigned node, capped per slot ────────
+            dx = xk - pos[q, 0]
+            dy = yk - pos[q, 1]
+            dist_xy = np.sqrt(dx**2 + dy**2) + 1e-9
+            step = min(dist_xy, max_step_xy)
+            new_pos[q, 0] = pos[q, 0] + (dx / dist_xy) * step
+            new_pos[q, 1] = pos[q, 1] + (dy / dist_xy) * step
 
-    for q in range(Q - 1):
-        dxy = new_pos[q+1, :2] - new_pos[q, :2]
-        dz  = new_pos[q+1, 2]  - new_pos[q, 2]
-        nxy = np.linalg.norm(dxy)
-        if nxy > max_step_xy:
-            new_pos[q+1, :2] = new_pos[q, :2] + dxy / nxy * max_step_xy
-        if abs(dz) > max_step_z:
-            new_pos[q+1, 2]  = new_pos[q, 2] + np.sign(dz) * max_step_z
+            # ── Z nudge: only lower for deprived nodes ───────────────────────
+            deficit = max(0.0, R_min - node_service[k])
+            urgency = min(1.0, deficit / (R_min + 1e-9))
+            if urgency > 0.01:
+                target_z = uav.H_MIN + (1.0 - urgency) * (pos[q, 2] - uav.H_MIN)
+                dz = target_z - pos[q, 2]
+                dz = np.clip(dz, -max_step_z, max_step_z)
+                new_pos[q, 2] = pos[q, 2] + dz
+            # else: altitude unchanged
+
+        else:
+            # Upload slot: nudge toward data-centre XY, altitude midpoint
+            xc, yc = env.data_center
+            dx = xc - pos[q, 0]
+            dy = yc - pos[q, 1]
+            dist_xy = np.sqrt(dx**2 + dy**2) + 1e-9
+            step = min(dist_xy, max_step_xy)
+            new_pos[q, 0] = pos[q, 0] + (dx / dist_xy) * step
+            new_pos[q, 1] = pos[q, 1] + (dy / dist_xy) * step
+            mid_z = (uav.H_MIN + uav.H_MAX) / 2
+            dz = np.clip(mid_z - pos[q, 2], -max_step_z, max_step_z)
+            new_pos[q, 2] = pos[q, 2] + dz
 
     new_pos[:, 2] = np.clip(new_pos[:, 2], uav.H_MIN, uav.H_MAX)
-    new_pos[Q-1]  = new_pos[0]
+    new_pos[Q-1]  = new_pos[0]   # periodic boundary
     return new_pos
 
 
