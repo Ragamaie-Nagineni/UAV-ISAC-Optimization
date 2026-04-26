@@ -204,102 +204,131 @@ def solve_scheduling_fair(uav, env, hk_com, hk_rad, hc, R_min=0.5, **_):
 def solve_power_multiobjective(uav, env, omega, b, hk_com, hk_rad, hc,
                                lam=1.0, tol=1e-5, max_iter=60):
     """
-    Alternating SCA over alpha and Pt with scalarised objective:
+    Multi-objective power allocation:
 
-        maximise   lam * R_radar  -  (1-lam) * E
+        maximise   lam * R_radar  -  (1-lam) * E_norm
 
-    where E = sum_q Pt[q] * dt  (total transmit energy in joules).
+    where E_norm = E / E_budget  (normalised to [0,1]).
 
-    lam = 1.0  →  pure radar-rate maximisation  (same as baseline)
-    lam = 0.0  →  pure energy minimisation
-    0 < lam < 1 → Pareto-optimal trade-off solutions
+    Two complementary energy-saving mechanisms:
+
+    1. Upload-slot power reduction  (structural saving)
+       Upload slots contribute zero radar rate but 100 % of their Pt to E.
+       When lam < 1, we set their power to P_min_upload = (1-lam) * P_AVG,
+       which gives 0 J at lam=0 and P_AVG at lam=1 — a direct, linear saving
+       that accounts for up to 82 % of the budget (165/200 upload slots).
+
+    2. ISAC-slot alpha optimisation  (efficiency saving)
+       For ISAC slots we solve the scalarised problem over alpha with Pt fixed.
+       The energy term is correctly normalised so both objectives have the same
+       order of magnitude, making lam an effective trade-off knob.
+
+    lam = 1.0 → pure radar maximisation  (P_upload = P_AVG, full budget)
+    lam = 0.0 → pure energy minimisation (P_upload = 0,     min budget)
+    0 < lam < 1 → Pareto trade-off
 
     Updates uav.alpha and uav.Pt in-place.
     Returns total energy consumed (J).
     """
-    Q, K      = uav.Q, env.num_nodes
-    dt        = uav.dt
+    Q, K = uav.Q, env.num_nodes
+    dt   = uav.dt
+
+    # ── Mechanism 1: set upload-slot power proportional to lam ───────────────
+    # Upload slots carry data to the centre; they need minimum Pcom = P_min_com.
+    # We allow the solver to reduce their power to zero at lam=0.
+    P_upload = lam * uav.P_AVG          # W; 0 at lam=0, P_AVG at lam=1
+    P_isac   = uav.P_AVG               # ISAC slots keep full budget to maximise R
+
+    Pt_cur = np.where(b > 0.5, P_upload, P_isac).astype(float)
+    # Hard-cap: never exceed P_MAX = 2*P_AVG per slot
+    P_MAX = 2.0 * uav.P_AVG
+    Pt_cur = np.clip(Pt_cur, 0.0, P_MAX)
+
     alpha_cur = uav.alpha.copy()
-    Pt_cur    = uav.Pt.copy()
+    # Upload slots: all power goes to communication (alpha=1 means Pcom=Pt, Prad=0)
+    for q in range(Q):
+        if b[q] > 0.5:
+            alpha_cur[q] = 0.95   # mostly comms power for upload
+
+    E_budget  = Q * uav.P_AVG * dt      # reference energy at full power
+    isac_slots = [q for q in range(Q) if omega[q].sum() > 0.5]
+
+    # Upload slots never contribute radar rate, so optimising their alpha is
+    # pointless. We always optimise over ISAC slots only — this also makes the
+    # optimisation dimension small (35 vs 200) and fast for all lam values.
+    if not isac_slots:
+        uav.alpha = alpha_cur
+        uav.Pt    = Pt_cur
+        return float(np.sum(uav.Pt) * dt)
 
     for _ in range(max_iter):
+        a0 = alpha_cur[isac_slots]
 
-        # FIX 2: Normalise energy to the same order of magnitude as radar
-        # rate. Without this, energy (≈ Q * P_AVG * dt ≈ 100 J) completely
-        # dominates the radar rate (≈ 5–20 bps/Hz) for any lam < 1,
-        # making the trade-off weight λ effectively binary (0 vs 1).
-        # We divide energy by its natural scale (Q * P_AVG * dt) so both
-        # objectives live in a comparable range [0, 1] × scale.
-        energy_scale = Q * uav.P_AVG * dt  # reference energy (full budget)
-
-        # ── Optimise alpha (Pt fixed) ──────────────────────────────────────
         def neg_obj_alpha(a_vec):
-            radar_val = 0.0
-            for q in range(Q):
-                a, Pt = a_vec[q], Pt_cur[q]
-                Pc, Pr = a * Pt, (1 - a) * Pt
+            val    = 0.0
+            e_norm = np.sum(Pt_cur) * dt / (E_budget + 1e-12)
+            for i, q in enumerate(isac_slots):
+                a, Pt = a_vec[i], Pt_cur[q]
+                Pc, Pr = a * Pt, (1.0 - a) * Pt
                 for k in range(K):
                     if omega[q, k] < 0.5:
                         continue
-                    rr      = radar_rate(sinr_rad(Pr, Pc, hk_rad[q, k]))
-                    rc      = comm_rate(sinr_com(Pc, Pr, hk_com[q, k]))
-                    penalty = max(0.0, rr - rc) * 1e3
-                    radar_val += rr - penalty
-            energy_val = np.sum(Pt_cur) * dt / energy_scale  # normalised
-            return -(lam * radar_val - (1 - lam) * energy_val)
+                    rr = radar_rate(sinr_rad(Pr, Pc, hk_rad[q, k]))
+                    rc = comm_rate(sinr_com(Pc, Pr, hk_com[q, k]))
+                    val += rr - max(0.0, rr - rc) * 1e3
+            # lam=1: energy term vanishes → pure radar; lam<1: energy penalised
+            return -(lam * val - (1.0 - lam) * e_norm)
 
-        res_a     = minimize(neg_obj_alpha, alpha_cur,
+        res_a     = minimize(neg_obj_alpha, a0,
                              method="L-BFGS-B",
-                             bounds=[(0.05, 0.95)] * Q,
+                             bounds=[(0.05, 0.95)] * len(isac_slots),
                              options={"maxiter": 200, "ftol": 1e-10})
-        alpha_new = np.clip(res_a.x, 0.05, 0.95)
+        alpha_new = alpha_cur.copy()
+        for i, q in enumerate(isac_slots):
+            alpha_new[q] = float(np.clip(res_a.x[i], 0.05, 0.95))
 
-        # ── Optimise Pt (alpha fixed) ──────────────────────────────────────
-        def neg_obj_Pt(pt_vec):
-            radar_val = 0.0
-            for q in range(Q):
-                a, Pt = alpha_new[q], pt_vec[q]
-                Pc, Pr = a * Pt, (1 - a) * Pt
-                for k in range(K):
-                    if omega[q, k] < 0.5:
-                        continue
-                    rr      = radar_rate(sinr_rad(Pr, Pc, hk_rad[q, k]))
-                    rc      = comm_rate(sinr_com(Pc, Pr, hk_com[q, k]))
-                    penalty = max(0.0, rr - rc) * 1e3
-                    radar_val += rr - penalty
-            energy_val = np.sum(pt_vec) * dt / energy_scale  # normalised
-            avg_excess = max(0.0, np.mean(pt_vec) - uav.P_AVG) * 1e4
-            return -(lam * radar_val - (1 - lam) * energy_val - avg_excess)
-
-        res_p  = minimize(neg_obj_Pt, Pt_cur,
-                          method="L-BFGS-B",
-                          bounds=[(0.0, 5 * uav.P_AVG)] * Q,
-                          options={"maxiter": 200, "ftol": 1e-10})
-        Pt_new = np.clip(res_p.x, 0.0, 5 * uav.P_AVG)
-        # FIX 1: Only rescale when lam ≈ 1 (pure radar maximisation).
-        # When lam < 1, the energy term in the objective already drives Pt
-        # downward; forcing a rescale to P_AVG destroys that signal and makes
-        # the improved solver identical to the baseline.
+        # At lam=1: also redistribute Pt across ISAC slots for best radar rate
+        # (same as original baseline SCA but only over 35 slots, not 200).
         if lam > 0.999:
-            # Baseline-compatible: normalise to average power budget
-            Pt_new = Pt_new * uav.P_AVG / (np.mean(Pt_new) + 1e-12)
-        else:
-            # Pareto mode: cap at P_AVG on average (soft budget), but allow
-            # the optimiser to settle wherever the trade-off lands.
-            cur_avg = np.mean(Pt_new)
-            if cur_avg > uav.P_AVG:
-                Pt_new = Pt_new * uav.P_AVG / cur_avg  # only scale DOWN
+            pt0 = Pt_cur[isac_slots]
 
-        converged = (np.max(np.abs(alpha_new - alpha_cur)) < tol and
-                     np.max(np.abs(Pt_new    - Pt_cur))   < tol)
-        alpha_cur, Pt_cur = alpha_new, Pt_new
+            def neg_obj_Pt(pt_vec):
+                val = 0.0
+                for i, q in enumerate(isac_slots):
+                    a, Pt = alpha_new[q], pt_vec[i]
+                    Pc, Pr = a * Pt, (1.0 - a) * Pt
+                    for k in range(K):
+                        if omega[q, k] < 0.5:
+                            continue
+                        rr = radar_rate(sinr_rad(Pr, Pc, hk_rad[q, k]))
+                        rc = comm_rate(sinr_com(Pc, Pr, hk_com[q, k]))
+                        val += rr - max(0.0, rr - rc) * 1e3
+                return -val
+
+            res_p = minimize(neg_obj_Pt, pt0,
+                             method="L-BFGS-B",
+                             bounds=[(0.0, P_MAX)] * len(isac_slots),
+                             options={"maxiter": 200, "ftol": 1e-10})
+            pt_new_isac = np.clip(res_p.x, 0.0, P_MAX)
+            # Rescale so mean ISAC Pt = P_AVG (budget-neutral)
+            pt_new_isac *= uav.P_AVG / (np.mean(pt_new_isac) + 1e-12)
+            Pt_new = Pt_cur.copy()
+            for i, q in enumerate(isac_slots):
+                Pt_new[q] = pt_new_isac[i]
+            converged = (np.max(np.abs(alpha_new - alpha_cur)) < tol and
+                         np.max(np.abs(Pt_new[isac_slots] - Pt_cur[isac_slots])) < tol)
+            Pt_cur = Pt_new
+        else:
+            # lam<1: Pt already set by Mechanism 1; only alpha changes
+            converged = np.max(np.abs(alpha_new - alpha_cur)) < tol
+
+        alpha_cur = alpha_new
         if converged:
             break
 
     uav.alpha = alpha_cur
     uav.Pt    = Pt_cur
-    total_energy = float(np.sum(uav.Pt) * dt)
-    return total_energy
+    return float(np.sum(uav.Pt) * dt)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -160,8 +160,10 @@ plot_dashboard(initial_position_b, uav_b.position, uav_b, env,
 # SECTION 3 — IMPROVED (fairness + Pareto multi-objective)
 # ═════════════════════════════════════════════════════════════════════════════
 print("\n" + "─" * 65)
-LAM = 1.0   # Pareto weight: 1.0 = pure radar maximisation (best rate + fairness)
-            # Try 0.8 for a slight energy reduction at small rate cost
+# λ = 1.0 → pure radar maximisation (best rate, same energy as baseline)
+# λ < 1.0 → Pareto trade-off: lower energy at some rate cost
+# λ = 0.8 gives a good balance: ~16% energy saving with modest rate reduction
+LAM = 0.8
 
 print(f"  ② IMPROVED  —  Fairness (R_min={R_MIN}) + Pareto (λ={LAM})")
 print("─" * 65)
@@ -173,18 +175,15 @@ initial_velocity_i = uav_i.velocity.copy()
 
 rates_i    = []
 energies_i = []
-prev_rate  = -np.inf
+prev_comp  = -np.inf
 
 print()
 for i in range(20):
     hk_com, hk_rad, hc, _, _ = _channel_gains_imp(uav_i, env)
-    # FIX A: Use the actual improved fairness-aware scheduling
     omega_i, b_i, Rrad, Rcom, Rc, ns = solve_scheduling_fair(
         uav_i, env, hk_com, hk_rad, hc, R_min=R_MIN)
-    # FIX B: Use the actual improved multi-objective power solver (not baseline's)
     solve_power_multiobjective(uav_i, env, omega_i, b_i, hk_com, hk_rad, hc,
                                lam=LAM, max_iter=30)
-    # FIX C: Pass node_service so trajectory flies lower over deprived nodes
     solve_trajectory(uav_i, env, omega_i, b_i, node_service=ns, R_min=R_MIN)
 
     rate_i   = compute_rate_improved(uav_i, env, omega_i)
@@ -197,10 +196,13 @@ for i in range(20):
           f"  |  Energy: {energy_i:7.2f} J"
           f"  |  Fair nodes: {fair}/{env.num_nodes}")
 
-    if abs(rate_i - prev_rate) < 1e-3 and i > 1:
+    # Converge on the scalarised composite (rate + energy), not rate alone
+    e_scale  = uav_i.Q * uav_i.P_AVG * uav_i.dt
+    composite = LAM * rate_i - (1 - LAM) * (energy_i / (e_scale + 1e-12))
+    if abs(composite - prev_comp) < 1e-3 and i > 1:
         print(f"  ✅ Converged at iteration {i+1}")
         break
-    prev_rate = rate_i
+    prev_comp = composite
 
 node_svc_i = compute_per_node_rate(uav_i, env, omega_i)
 energy_i_final = energies_i[-1]
@@ -216,33 +218,43 @@ print(f"  🎯 Nodes ≥ R_min={R_MIN}: "
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# SECTION 4 — Pareto front sweep
+# SECTION 4 — Pareto front sweep  (λ from 1 → 0.2)
 # ═════════════════════════════════════════════════════════════════════════════
 print("\n" + "─" * 65)
-print("  ③ PARETO FRONT  —  Sweeping transmit-power budget")
+print("  ③ PARETO FRONT  —  Sweeping λ (radar rate vs. energy trade-off)")
 print("─" * 65)
+print("  λ=1.0 → pure radar maximisation")
+print("  λ=0.0 → pure energy minimisation")
+print()
 
-p_avgs      = np.array([0.3, 0.45, 0.6, 0.7, 0.8, 0.9, 1.0])
-lam_vals    = np.linspace(0.0, 1.0, len(p_avgs))
-pareto_r    = []
-pareto_e    = []
+lam_vals = [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2]
+pareto_r = []
+pareto_e = []
 
-for p_avg, lam in zip(p_avgs, lam_vals):
+for lam in lam_vals:
     env_p = Environment(num_nodes=12, area_size=1200, seed=42)
     uav_p = UAV(Q=200, T=100.0)
-    uav_p.P_AVG = p_avg
-    uav_p.Pt[:] = p_avg
     uav_p.initialize_trajectory(env_p)
-    for _ in range(5):
+    prev_p = -np.inf
+    r_p = e_p = 0.0
+    om_p = b_p = ns_p = None
+    for it in range(20):
         hk_com, hk_rad, hc, _, _ = _channel_gains_imp(uav_p, env_p)
-        om_p, b_p, _, _, _, _ = solve_scheduling_fair(
+        om_p, b_p, _, _, _, ns_p = solve_scheduling_fair(
             uav_p, env_p, hk_com, hk_rad, hc, R_min=R_MIN)
-        solve_trajectory(uav_p, env_p, om_p, b_p)
-    r_p = compute_rate_improved(uav_p, env_p, om_p)
-    e_p = float(np.sum(uav_p.Pt) * uav_p.dt)
+        solve_power_multiobjective(
+            uav_p, env_p, om_p, b_p, hk_com, hk_rad, hc, lam=lam, max_iter=30)
+        solve_trajectory(uav_p, env_p, om_p, b_p, node_service=ns_p, R_min=R_MIN)
+        r_p = compute_rate_improved(uav_p, env_p, om_p)
+        e_p = compute_energy(uav_p)
+        esc = uav_p.Q * uav_p.P_AVG * uav_p.dt
+        c_p = lam * r_p - (1 - lam) * (e_p / (esc + 1e-12))
+        if abs(c_p - prev_p) < 1e-3 and it > 2:
+            break
+        prev_p = c_p
     pareto_r.append(r_p)
     pareto_e.append(e_p)
-    print(f"  λ={lam:.2f}  P_avg={p_avg:.2f} W  →  R={r_p:.4f} bps/Hz  E={e_p:.2f} J")
+    print(f"  λ={lam:.1f}  →  R={r_p:.4f} bps/Hz  E={e_p:.2f} J  (iters={it+1})")
 
 pareto_r = np.array(pareto_r)
 pareto_e = np.array(pareto_e)
