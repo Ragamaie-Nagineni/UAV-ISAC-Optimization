@@ -84,18 +84,42 @@ def _all_rates(uav, hk_com, hk_rad, hc):
 # Sub-problem 1: Fairness-aware task scheduling  (Improvement 2)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _reachable_slots(uav, env, k):
+    """Return list of slot indices that can physically reach node k."""
+    Q   = uav.Q
+    tan2 = np.tan(uav.THETA) ** 2
+    xk, yk = env.nodes[k]
+    reachable = []
+    for q in range(Q):
+        xu, yu = uav.position[q, 0], uav.position[q, 1]
+        Hu     = uav.position[q, 2]
+        horiz2 = (xu - xk)**2 + (yu - yk)**2
+        if horiz2 <= Hu**2 * tan2:
+            reachable.append(q)
+    return reachable
+
+
 def solve_scheduling_fair(uav, env, hk_com, hk_rad, hc, R_min=0.5, **_):
     """
-    Two-stage fairness-aware greedy scheduling.
+    Two-stage fairness-aware greedy scheduling — with three improvements:
 
-    Stage A – for every node below R_min, greedily assign the single best
-              available slot that (a) is within the radar cone, (b) satisfies
-              Rrad ≤ Rcom, and (c) yields the highest radar rate for that node.
-              Repeat until all nodes reach R_min or no feasible slot remains.
+    Pre-pass  – Compute per-node effective R_min_k based on how many slots
+                actually reach each node. If a node has only 1-2 reachable
+                slots, its floor is capped at 0.7 × average reachable rate
+                so Stage A doesn't exhaust the pool chasing an impossible
+                target. Nodes with no reachable slots are skipped gracefully.
 
-    Stage B – fill remaining slots with the standard greedy policy (best
-              reachable node, ignoring fairness since Stage A already satisfied
-              the constraint).
+    Stage A   – For every node below its R_min_k, greedily assign the single
+                best available slot (in-range, feasible, highest rate).
+                Iterate most-deprived-first until all reachable nodes are
+                at their floor or no feasible slot remains.
+
+    Stage B   – Fill remaining slots using a fairness-weighted score:
+                    score(q,k) = Rrad[q,k] × (1 + equity_bonus(k))
+                where equity_bonus = R_min / (node_service[k] + epsilon)
+                for nodes above the floor and 0 for nodes at their cap.
+                This pushes spread above the R_min floor rather than
+                flat-clumping everyone at exactly 0.5.
 
     Enforces the global upload-capacity constraint afterwards (same as baseline).
     """
@@ -106,21 +130,43 @@ def solve_scheduling_fair(uav, env, hk_com, hk_rad, hc, R_min=0.5, **_):
 
     Rrad_all, Rcom_all, Rc_all = _all_rates(uav, hk_com, hk_rad, hc)
 
+    # ── Pre-pass: compute reachable-aware R_min_k per node ──────────────────
+    R_min_k = np.full(K, R_min)
+    for k in range(K):
+        reachable = _reachable_slots(uav, env, k)
+        if len(reachable) == 0:
+            R_min_k[k] = 0.0     # unreachable: skip gracefully
+            continue
+        # Feasible rates from reachable slots
+        feasible_rates = [
+            Rrad_all[q, k]
+            for q in reachable
+            if Rrad_all[q, k] <= Rcom_all[q, k] + 1e-9 and Rrad_all[q, k] > 1e-9
+        ]
+        if len(feasible_rates) == 0:
+            R_min_k[k] = 0.0     # no feasible assignment possible
+            continue
+        avg_r = np.mean(feasible_rates)
+        # Cap floor at 70% of average reachable rate to stay achievable
+        R_min_k[k] = min(R_min, 0.70 * avg_r * len(feasible_rates))
+
     # Accumulated radar service per node [bps/Hz · slots]
     node_service  = np.zeros(K)
     slot_assigned = np.zeros(Q, dtype=bool)   # True once slot is used
 
-    # ── Stage A: satisfy R_min for all nodes ────────────────────────────────
+    # ── Stage A: satisfy R_min_k for all nodes ───────────────────────────────
     changed = True
     while changed:
         changed = False
-        # Priority: most-deprived node first
-        deficit = R_min - node_service
-        order   = np.argsort(-deficit)        # descending deficit
+        # Priority: largest proportional deficit first (avoids zero-floor nodes)
+        deficit = np.where(R_min_k > 1e-9,
+                           (R_min_k - node_service) / (R_min_k + 1e-9),
+                           0.0)
+        order   = np.argsort(-deficit)
 
         for k in order:
-            if node_service[k] >= R_min:
-                continue                       # already satisfied
+            if R_min_k[k] < 1e-9 or node_service[k] >= R_min_k[k]:
+                continue   # already satisfied or unreachable
 
             # Find the best unassigned slot for this node
             best_q, best_r = -1, -np.inf
@@ -138,12 +184,14 @@ def solve_scheduling_fair(uav, env, hk_com, hk_rad, hc, R_min=0.5, **_):
                     best_r = Rrad_all[q, k]
 
             if best_q >= 0:
-                omega[best_q, k]    = 1
+                omega[best_q, k]     = 1
                 slot_assigned[best_q] = True
-                node_service[k]    += best_r
-                changed = True       # schedule changed → restart priority loop
+                node_service[k]      += best_r
+                changed = True   # restart priority loop
 
-    # ── Stage B: greedy fill for remaining unassigned slots ─────────────────
+    # ── Stage B: fairness-weighted greedy fill ────────────────────────────────
+    # Equity bonus rewards assigning to nodes that are above their floor but
+    # still relatively under-served, pushing distribution above the flat minimum.
     for q in range(Q):
         if slot_assigned[q]:
             continue
@@ -157,12 +205,21 @@ def solve_scheduling_fair(uav, env, hk_com, hk_rad, hc, R_min=0.5, **_):
             in_range = horiz2 <= Hu**2 * tan2
             feasible = Rrad_all[q, k] <= Rcom_all[q, k] + 1e-9
             if in_range and feasible:
-                candidates.append((Rrad_all[q, k], k))
+                # Equity bonus: inversely proportional to current service
+                # For nodes already at R_min_k floor: small bonus; for nodes
+                # well above floor: bonus fades, preserving radar-rate priority
+                if node_service[k] < 1e-9:
+                    equity = 2.0   # strongly prefer zero-service nodes
+                else:
+                    equity = min(2.0, R_min / (node_service[k] + 1e-9))
+                score = Rrad_all[q, k] * (1.0 + equity)
+                candidates.append((score, k))
 
         if candidates:
             best_k = max(candidates, key=lambda x: x[0])[1]
             omega[q, best_k]  = 1
             slot_assigned[q]  = True
+            node_service[best_k] += Rrad_all[q, best_k]
         else:
             b[q] = 1
 
@@ -170,6 +227,7 @@ def solve_scheduling_fair(uav, env, hk_com, hk_rad, hc, R_min=0.5, **_):
     for q in range(Q):
         if not slot_assigned[q]:
             b[q] = 1
+            omega[q] = 0
 
     # ── Enforce global upload capacity (eq. 23g) ─────────────────────────────
     total_isac_rate   = sum(Rrad_all[q, int(np.argmax(omega[q]))]
@@ -179,15 +237,14 @@ def solve_scheduling_fair(uav, env, hk_com, hk_rad, hc, R_min=0.5, **_):
     if total_isac_rate > total_upload_rate + 1e-9:
         isac_slots = [(q, int(np.argmax(omega[q])))
                       for q in range(Q) if omega[q].sum() > 0.5]
-        # Remove lowest-rate ISAC slots first, but avoid dropping a slot if
-        # that would push some node below R_min
+        # Remove lowest-rate ISAC slots first, but protect fairness floor R_min_k
         isac_slots.sort(key=lambda x: Rrad_all[x[0], x[1]])
         for q, k in isac_slots:
             if total_isac_rate <= total_upload_rate + 1e-9:
                 break
-            # Check if dropping hurts fairness
-            if node_service[k] - Rrad_all[q, k] < R_min:
-                continue    # skip: would violate fairness
+            # Check if dropping hurts fairness below *effective* floor
+            if node_service[k] - Rrad_all[q, k] < R_min_k[k]:
+                continue    # skip: would violate per-node fairness floor
             total_isac_rate  -= Rrad_all[q, k]
             node_service[k]  -= Rrad_all[q, k]
             omega[q, k]       = 0

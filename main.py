@@ -78,12 +78,24 @@ R_MIN = 0.5   # fairness floor (bps/Hz per node)
 # ─────────────────────────────────────────────────────────────────────────────
 # Helper: Jain's fairness index
 # ─────────────────────────────────────────────────────────────────────────────
-def jain_index(x):
+def jain_index(x, include_zeros=True):
+    """Jain's fairness index.
+
+    include_zeros=True  (default, honest):  computes over ALL nodes.
+        Penalises any node with zero service — if 3/12 nodes get nothing,
+        the index reflects that no matter how uniform the rest are.
+        This is the correct metric for a fairness-constrained system.
+
+    include_zeros=False (legacy):  filters out zero-service nodes before
+        computing. Matches the original code but can give a falsely high
+        index when many nodes are silently starved.
+    """
     x = np.array(x, dtype=float)
-    x = x[x > 0]
+    if not include_zeros:
+        x = x[x > 0]
     if len(x) == 0:
         return 0.0
-    return (np.sum(x) ** 2) / (len(x) * np.sum(x ** 2))
+    return (np.sum(x) ** 2) / (len(x) * np.sum(x ** 2) + 1e-15)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -268,8 +280,10 @@ print("  FINAL COMPARISON SUMMARY")
 print("=" * 65)
 delta_rate   = rates_i[-1] - rates_b[-1]
 delta_energy = energy_i_final - energy_b
-jain_b = jain_index(node_svc_b)
-jain_i = jain_index(node_svc_i)
+jain_b      = jain_index(node_svc_b, include_zeros=True)   # honest: all 12 nodes
+jain_i      = jain_index(node_svc_i, include_zeros=True)   # honest: all 12 nodes
+jain_b_old  = jain_index(node_svc_b, include_zeros=False)  # legacy: served only
+jain_i_old  = jain_index(node_svc_i, include_zeros=False)  # legacy: served only
 n_fair_b = int(np.sum(node_svc_b >= R_MIN))
 n_fair_i = int(np.sum(node_svc_i >= R_MIN))
 
@@ -280,7 +294,9 @@ print(f"  Energy       |  Baseline: {energy_b:.2f} J   "
 print(f"  Fair Nodes   |  Baseline: {n_fair_b}/{env.num_nodes}          "
       f"Improved: {n_fair_i}/{env.num_nodes}")
 print(f"  Jain Index   |  Baseline: {jain_b:.4f}    "
-      f"Improved: {jain_i:.4f}    Δ={jain_i - jain_b:+.4f}")
+      f"Improved: {jain_i:.4f}    Δ={jain_i - jain_b:+.4f}  (all nodes)")
+print(f"  Jain (srv'd) |  Baseline: {jain_b_old:.4f}    "
+      f"Improved: {jain_i_old:.4f}    Δ={jain_i_old - jain_b_old:+.4f}  (served nodes only)")
 print("=" * 65)
 
 
@@ -480,10 +496,14 @@ summary_text = (
     f"  Fairness (R_min={R_MIN})\n"
     f"    Baseline : {n_fair_b}/{K} nodes\n"
     f"    Improved : {n_fair_i}/{K} nodes\n\n"
-    f"  Jain Index\n"
+    f"  Jain (all nodes)\n"
     f"    Baseline : {jain_b:.4f}\n"
     f"    Improved : {jain_i:.4f}\n"
-    f"    Δ        : {jain_i - jain_b:+.4f}"
+    f"    Δ        : {jain_i - jain_b:+.4f}\n\n"
+    f"  Jain (served only)\n"
+    f"    Baseline : {jain_b_old:.4f}\n"
+    f"    Improved : {jain_i_old:.4f}\n"
+    f"    Δ        : {jain_i_old - jain_b_old:+.4f}"
 )
 ax.text(0.05, 0.95, summary_text, transform=ax.transAxes,
         fontsize=10, va="top", fontfamily="monospace",
