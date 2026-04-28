@@ -57,8 +57,18 @@ from utils import h_rad, sinr_rad, radar_rate, distance_3d
 # ─────────────────────────────────────────────────────────────────────────────
 # Output directories
 # ─────────────────────────────────────────────────────────────────────────────
+import glob
+
 for d in ["output_plots_baseline", "output_plots_improved", "output_plots_comparison"]:
     os.makedirs(d, exist_ok=True)
+
+# Remove any stale PNG files from previous runs so only current outputs remain
+for old_png in glob.glob("output_plots_comparison/*.png"):
+    os.remove(old_png)
+for old_png in glob.glob("output_plots_baseline/*.png"):
+    os.remove(old_png)
+for old_png in glob.glob("output_plots_improved/*.png"):
+    os.remove(old_png)
 
 R_MIN = 0.5   # fairness floor (bps/Hz per node)
 LAM   = 0.8   # Pareto weight for improved
