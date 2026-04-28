@@ -7,19 +7,18 @@ Implements the system from:
   Liu et al., "UAV Assisted Integrated Sensing and Communications for IoT:
   3D Trajectory Optimization and Resource Allocation," IEEE TWC 2024.
 
-This version runs BOTH:
-  ① Baseline  – original Algorithm 2 (single-objective, no fairness)
-  ② Improved  – multi-objective Pareto + min-rate fairness constraint
+Runs BOTH:
+  Baseline  - original Algorithm 2 (single-objective, no fairness)
+  Improved  - multi-objective + min-rate fairness constraint
 
-Then generates all individual plots AND a side-by-side comparison dashboard.
-
-Workflow
---------
-1. Initialise environment (IoT nodes + data-collection centre).
-2. Run BASELINE: Algorithm 2 (radar rate maximisation only).
-3. Run IMPROVED: fairness-aware scheduling + Pareto power allocation.
-4. Compute Pareto front by sweeping transmit-power budget.
-5. Report results and generate all plots.
+Outputs:
+  output_plots_baseline/   <- all individual paper-style plots for baseline
+  output_plots_improved/   <- all individual paper-style plots for improved
+  output_plots_comparison/ <- 4 comparison figures:
+                               fig1_convergence_comparison.png
+                               fig2_power_comparison.png
+                               fig3_task_scheduling_comparison.png
+                               fig4_trajectory_comparison.png
 """
 
 import numpy as np
@@ -28,7 +27,9 @@ import os
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
+from mpl_toolkits.mplot3d import Axes3D          # noqa: F401
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 
 from environment import Environment
 from uav import UAV
@@ -45,62 +46,286 @@ from optimization_baseline import (
 from optimization_improved import (
     _channel_gains as _channel_gains_imp,
     solve_scheduling_fair,
-    solve_power_multiobjective,   # FIX: use the actual improved power solver
+    solve_power_multiobjective,
     solve_trajectory,
     compute_total_radar_rate as compute_rate_improved,
-    compute_per_node_rate,
     compute_energy,
 )
 
 from utils import h_rad, sinr_rad, radar_rate, distance_3d
 
-# ── Visualization imports (original paper plots) ─────────────────────────────
-from visualization import (
-    plot_3d_trajectory,
-    plot_top_view,
-    plot_convergence,
-    plot_scheduling,
-    plot_altitude,
-    plot_speed,
-    plot_power,
-    plot_dashboard,
-)
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Directories
+# Output directories
 # ─────────────────────────────────────────────────────────────────────────────
-for d in ["output_plots", "output_plots_baseline",
-          "output_plots_improved", "output_plots_comparison"]:
+for d in ["output_plots_baseline", "output_plots_improved", "output_plots_comparison"]:
     os.makedirs(d, exist_ok=True)
 
 R_MIN = 0.5   # fairness floor (bps/Hz per node)
+LAM   = 0.8   # Pareto weight for improved
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helper: Jain's fairness index
-# ─────────────────────────────────────────────────────────────────────────────
-def jain_index(x, include_zeros=True):
-    """Jain's fairness index.
-
-    include_zeros=True  (default, honest):  computes over ALL nodes.
-        Penalises any node with zero service — if 3/12 nodes get nothing,
-        the index reflects that no matter how uniform the rest are.
-        This is the correct metric for a fairness-constrained system.
-
-    include_zeros=False (legacy):  filters out zero-service nodes before
-        computing. Matches the original code but can give a falsely high
-        index when many nodes are silently starved.
-    """
-    x = np.array(x, dtype=float)
-    if not include_zeros:
-        x = x[x > 0]
-    if len(x) == 0:
-        return 0.0
-    return (np.sum(x) ** 2) / (len(x) * np.sum(x ** 2) + 1e-15)
+# Colour constants
+C_BLUE   = "#1565C0"
+C_GREEN  = "#2E7D32"
+C_RED    = "#C62828"
+C_ORANGE = "darkorange"
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# Shared drawing helpers  (draw onto an existing Axes object)
+# =============================================================================
+
+def _draw_scheduling(ax, omega, b, env, title="UAV Task Scheduling per Time Slot"):
+    """Paper Fig.4 style task-scheduling colour bar on ax."""
+    Q, K = omega.shape
+    sched = np.full(Q, -1, dtype=int)
+    for q in range(Q):
+        if b[q] > 0.5:
+            sched[q] = 0
+        else:
+            for k in range(K):
+                if omega[q, k] > 0.5:
+                    sched[q] = k + 1
+
+    cmap = plt.cm.tab20(np.linspace(0, 1, K + 1))
+    bar_colors = [cmap[s] if s >= 0 else "grey" for s in sched]
+    ax.bar(range(Q), np.ones(Q), color=bar_colors, width=1.0)
+
+    patches = [Patch(color=cmap[0], label="Data Centre")]
+    for k in range(K):
+        patches.append(Patch(color=cmap[k + 1], label=f"Node {k+1}"))
+    ax.legend(handles=patches, fontsize=7, ncol=4, loc="upper right", framealpha=0.8)
+    ax.set_xlabel("Time Slot Index", fontsize=11)
+    ax.set_ylabel("Assigned Target", fontsize=11)
+    ax.set_title(title, fontsize=12)
+    ax.set_yticks([])
+    ax.grid(axis="x", alpha=0.3)
+
+
+def _draw_top_view(ax, init_pos, final_pos, env, omega, title="Top-View Trajectory"):
+    """Paper Fig.3 style top-view trajectory on ax."""
+    K = env.num_nodes
+    Q = final_pos.shape[0]
+
+    ax.scatter(env.nodes[:, 0], env.nodes[:, 1],
+               c="red", s=60, marker="^", zorder=5, label="IoT Nodes")
+    ax.scatter(*env.data_center, c="black", s=100, marker="*",
+               zorder=6, label="Data Centre")
+    for k in range(K):
+        ax.annotate(str(k + 1), env.nodes[k], fontsize=7, color="darkred",
+                    xytext=(4, 4), textcoords="offset points")
+
+    ax.plot(init_pos[:, 0], init_pos[:, 1],
+            color=C_ORANGE, linewidth=1.2, alpha=0.6, label="Initial")
+
+    if omega is not None:
+        for q in range(Q - 1):
+            isac_slot = any(omega[q, k] > 0.5 for k in range(K))
+            col = C_BLUE if isac_slot else C_GREEN
+            ax.plot(final_pos[q:q+2, 0], final_pos[q:q+2, 1],
+                    color=col, linewidth=1.6)
+        extra = [
+            Line2D([0], [0], color=C_BLUE,  lw=2, label="ISAC"),
+            Line2D([0], [0], color=C_GREEN, lw=2, label="Upload"),
+        ]
+        handles, _ = ax.get_legend_handles_labels()
+        ax.legend(handles=handles + extra, fontsize=8)
+    else:
+        ax.plot(final_pos[:, 0], final_pos[:, 1], color=C_BLUE, lw=2, label="Optimised")
+        ax.legend(fontsize=8)
+
+    ax.set_xlabel("X (m)", fontsize=11)
+    ax.set_ylabel("Y (m)", fontsize=11)
+    ax.set_title(title, fontsize=12)
+    ax.set_aspect("equal")
+    ax.grid(True, alpha=0.3)
+
+
+# =============================================================================
+# Individual plot generator  (all paper-style plots for one run)
+# =============================================================================
+
+def generate_individual_plots(out_dir, label,
+                               init_pos, final_pos,
+                               init_vel,  final_vel,
+                               uav, env, rates, omega, b):
+    """Save all individual paper-style plots into out_dir."""
+    Q = uav.Q
+    K = env.num_nodes
+
+    def _save(fig, name):
+        path = os.path.join(out_dir, name)
+        fig.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"   Saved -> {path}")
+
+    # ------------------------------------------------------------------
+    # Plot 1: 3-D Trajectory  (Fig. 2 of paper)
+    # ------------------------------------------------------------------
+    fig = plt.figure(figsize=(10, 7))
+    ax  = fig.add_subplot(111, projection="3d")
+
+    ax.scatter(env.nodes[:, 0], env.nodes[:, 1], np.zeros(K),
+               c="red", s=60, marker="^", zorder=5, label="IoT Nodes")
+    ax.scatter(*env.data_center, 0, c="black", s=100, marker="*",
+               zorder=6, label="Data Centre")
+    for k in range(K):
+        ax.text(env.nodes[k, 0], env.nodes[k, 1], 5,
+                str(k + 1), fontsize=7, color="darkred")
+
+    ax.plot(init_pos[:, 0], init_pos[:, 1], init_pos[:, 2],
+            color=C_ORANGE, lw=1.2, alpha=0.6, label="Initial trajectory")
+
+    if omega is not None:
+        for q in range(Q - 1):
+            col = C_BLUE if any(omega[q, k] > 0.5 for k in range(K)) else C_GREEN
+            ax.plot(final_pos[q:q+2, 0], final_pos[q:q+2, 1], final_pos[q:q+2, 2],
+                    color=col, lw=2)
+        extra = [Line2D([0],[0], color=C_BLUE,  lw=2, label="ISAC"),
+                 Line2D([0],[0], color=C_GREEN, lw=2, label="Upload")]
+        handles, _ = ax.get_legend_handles_labels()
+        ax.legend(handles=handles + extra, fontsize=8)
+    else:
+        ax.plot(final_pos[:, 0], final_pos[:, 1], final_pos[:, 2],
+                color=C_BLUE, lw=2, label="Optimised")
+        ax.legend(fontsize=8)
+
+    ax.set_xlabel("X (m)"); ax.set_ylabel("Y (m)"); ax.set_zlabel("Altitude (m)")
+    ax.set_title(f"[{label}] Initial vs. Optimised 3-D UAV Trajectory", fontsize=12)
+    _save(fig, "3d_trajectory.png")
+
+    # ------------------------------------------------------------------
+    # Plot 2: Top-view trajectory  (Fig. 3 of paper)
+    # ------------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(8, 8))
+    _draw_top_view(ax, init_pos, final_pos, env, omega,
+                   title=f"[{label}] Top View – Initial vs. Optimised Trajectory")
+    _save(fig, "top_view_trajectory.png")
+
+    # ------------------------------------------------------------------
+    # Plot 3: Convergence  (Fig. 9 / 12 of paper)
+    # ------------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(range(1, len(rates) + 1), rates,
+            color=C_BLUE, lw=2.5, marker="o", ms=6, label=label)
+    ax.set_xlabel("Number of Iterations", fontsize=12)
+    ax.set_ylabel("Sum Radar Estimation Rate (bps/Hz)", fontsize=12)
+    ax.set_title(f"[{label}] Convergence of Three-Layer Optimisation", fontsize=13)
+    ax.legend(fontsize=10); ax.grid(True, alpha=0.4)
+    _save(fig, "convergence_rate.png")
+
+    # ------------------------------------------------------------------
+    # Plot 4: Task scheduling  (Fig. 4 of paper)
+    # ------------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(12, 4))
+    _draw_scheduling(ax, omega, b, env,
+                     title=f"[{label}] UAV Task Scheduling per Time Slot")
+    fig.tight_layout()
+    _save(fig, "task_scheduling.png")
+
+    # ------------------------------------------------------------------
+    # Plot 5: Altitude profile
+    # ------------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(9, 4))
+    ax.plot(range(Q), init_pos[:, 2], color=C_ORANGE, lw=1.5, alpha=0.7, label="Initial")
+    ax.plot(range(Q), final_pos[:, 2], color=C_BLUE, lw=2, label="Optimised")
+    ax.axhline(uav.H_MIN, color="grey", ls="--", lw=0.8, label="H_min")
+    ax.axhline(uav.H_MAX, color="grey", ls=":",  lw=0.8, label="H_max")
+    ax.set_xlabel("Time Slot Index", fontsize=12)
+    ax.set_ylabel("Altitude (m)", fontsize=12)
+    ax.set_title(f"[{label}] UAV Flight Altitude Profile", fontsize=13)
+    ax.legend(); ax.grid(True, alpha=0.4)
+    _save(fig, "altitude_profile.png")
+
+    # ------------------------------------------------------------------
+    # Plot 6: Speed profile  (Fig. 6 of paper)
+    # ------------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(9, 4))
+    i_spd = np.linalg.norm(init_vel,      axis=1)
+    f_spd = np.linalg.norm(final_vel,     axis=1)
+    h_spd = np.linalg.norm(final_vel[:, :2], axis=1)
+    v_spd = np.abs(final_vel[:, 2])
+    ax.plot(range(Q), i_spd, color=C_ORANGE, lw=1.2, alpha=0.6, label="Initial speed")
+    ax.plot(range(Q), f_spd, color=C_BLUE,   lw=2,              label="Optimised total speed")
+    ax.plot(range(Q), h_spd, color=C_GREEN,  lw=1.2, ls="--",  label="Optimised horizontal speed")
+    ax.plot(range(Q), v_spd, color=C_RED,    lw=1.2, ls=":",   label="Optimised vertical speed")
+    ax.set_xlabel("Time Slot Index", fontsize=12)
+    ax.set_ylabel("Speed (m/s)", fontsize=12)
+    ax.set_title(f"[{label}] UAV Speed Profile", fontsize=13)
+    ax.legend(fontsize=8); ax.grid(True, alpha=0.4)
+    _save(fig, "speed_profile.png")
+
+    # ------------------------------------------------------------------
+    # Plot 7: Power allocation  (Fig. 8 of paper)
+    # ------------------------------------------------------------------
+    slots = np.arange(Q)
+    fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
+    axes[0].bar(slots, uav.Pcom, label="P_com (α·Pt)",        color=C_BLUE, width=1.0)
+    axes[0].bar(slots, uav.Prad, bottom=uav.Pcom,
+                label="P_rad ((1-α)·Pt)", color=C_RED,  width=1.0)
+    axes[0].set_ylabel("Power (W)", fontsize=11)
+    axes[0].set_title(f"[{label}] Transmit Power Allocation per Time Slot", fontsize=12)
+    axes[0].legend(fontsize=8); axes[0].grid(axis="y", alpha=0.4)
+    axes[1].plot(slots, uav.alpha, color="#ff7f0e", lw=1.5)
+    axes[1].axhline(0.5, color="grey", ls="--", lw=0.8)
+    axes[1].set_ylabel("α (comm. fraction)", fontsize=11)
+    axes[1].set_xlabel("Time Slot Index", fontsize=11)
+    axes[1].set_ylim(0, 1)
+    axes[1].set_title(f"[{label}] Power Split Factor α", fontsize=12)
+    axes[1].grid(True, alpha=0.4)
+    fig.tight_layout()
+    _save(fig, "power_allocation.png")
+
+    # ------------------------------------------------------------------
+    # Plot 8: Dashboard  (6-panel summary)
+    # ------------------------------------------------------------------
+    fig, axes = plt.subplots(2, 3, figsize=(18, 11))
+    fig.suptitle(f"UAV-ISAC Optimisation Dashboard — {label}",
+                 fontsize=14, fontweight="bold")
+
+    # Panel 1: top-view trajectory
+    _draw_top_view(axes[0, 0], init_pos, final_pos, env, omega,
+                   title="Top-View Trajectory")
+
+    # Panel 2: convergence
+    axes[0, 1].plot(range(1, len(rates) + 1), rates,
+                    marker="o", lw=2, color=C_BLUE)
+    axes[0, 1].set_title("Convergence")
+    axes[0, 1].set_xlabel("Iteration"); axes[0, 1].set_ylabel("Rate (bps/Hz)")
+    axes[0, 1].grid(True, alpha=0.4)
+
+    # Panel 3: altitude
+    axes[0, 2].plot(range(Q), init_pos[:, 2], color=C_ORANGE, lw=1, alpha=0.6, label="Init")
+    axes[0, 2].plot(range(Q), final_pos[:, 2], color=C_BLUE, lw=2, label="Opt")
+    axes[0, 2].axhline(uav.H_MIN, color="grey", ls="--", lw=0.8)
+    axes[0, 2].axhline(uav.H_MAX, color="grey", ls=":",  lw=0.8)
+    axes[0, 2].set_title("Altitude Profile")
+    axes[0, 2].set_xlabel("Slot"); axes[0, 2].set_ylabel("m")
+    axes[0, 2].legend(fontsize=8); axes[0, 2].grid(True, alpha=0.4)
+
+    # Panel 4: task scheduling
+    _draw_scheduling(axes[1, 0], omega, b, env, title="Task Scheduling")
+
+    # Panel 5: alpha
+    axes[1, 1].plot(range(Q), uav.alpha, color="#ff7f0e", lw=1.5)
+    axes[1, 1].axhline(0.5, color="grey", ls="--", lw=0.8)
+    axes[1, 1].set_title("Power Split α")
+    axes[1, 1].set_xlabel("Slot"); axes[1, 1].set_ylabel("α")
+    axes[1, 1].set_ylim(0, 1); axes[1, 1].grid(True, alpha=0.4)
+
+    # Panel 6: speed
+    axes[1, 2].plot(range(Q), np.linalg.norm(final_vel, axis=1),
+                    color="#17becf", lw=1.5)
+    axes[1, 2].set_title("UAV Speed")
+    axes[1, 2].set_xlabel("Slot"); axes[1, 2].set_ylabel("m/s")
+    axes[1, 2].grid(True, alpha=0.4)
+
+    fig.tight_layout()
+    _save(fig, "dashboard.png")
+
+
+# =============================================================================
 # SECTION 1 — Common environment
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 print("=" * 65)
 print("  UAV-ISAC 3-D Trajectory Optimisation")
 print("  (Liu et al., IEEE TWC 2024)  —  Baseline + Improved")
@@ -111,420 +336,216 @@ env.print_state()
 print()
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # SECTION 2 — BASELINE (original paper Algorithm 2)
-# ═════════════════════════════════════════════════════════════════════════════
-print("─" * 65)
-print("  ① BASELINE  —  Single-objective, no fairness constraint")
-print("─" * 65)
+# =============================================================================
+print("-" * 65)
+print("  BASELINE  -  Single-objective, no fairness constraint")
+print("-" * 65)
 
 uav_b = UAV(Q=200, T=100.0)
 uav_b.initialize_trajectory(env)
-initial_position_b = uav_b.position.copy()
-initial_velocity_b = uav_b.velocity.copy()
+init_pos_b = uav_b.position.copy()
+init_vel_b = uav_b.velocity.copy()
 
 hk_com0, hk_rad0, hc0, _, _ = _channel_gains(uav_b, env)
 omega0, b0, _, _, _ = solve_scheduling(uav_b, env, hk_com0, hk_rad0, hc0)
-initial_rate_b = compute_rate_baseline(uav_b, env, omega0)
-print(f"\n  📶 Initial Radar Rate : {initial_rate_b:.4f} bps/Hz\n")
+print(f"\n  Initial Radar Rate : {compute_rate_baseline(uav_b, env, omega0):.4f} bps/Hz\n")
 
 rates_b, omega_hist_b = three_layer_optimize(
     uav_b, env, max_outer=20, tol=1e-3, verbose=True)
 
-omega_final_b = omega_hist_b[-1]
+omega_b = omega_hist_b[-1]
 hk_com_f, hk_rad_f, hc_f, _, _ = _channel_gains(uav_b, env)
-_, b_final_b, _, _, _ = solve_scheduling(uav_b, env, hk_com_f, hk_rad_f, hc_f)
-
-# Per-node service
-node_svc_b = np.zeros(env.num_nodes)
-for q in range(uav_b.Q):
-    for k in range(env.num_nodes):
-        if omega_final_b[q, k] > 0.5:
-            d = distance_3d(uav_b.position[q], env.node_pos3d(k))
-            sr = sinr_rad(uav_b.Prad[q], uav_b.Pcom[q], h_rad(d))
-            node_svc_b[k] += radar_rate(sr)
+_, b_b, _, _, _ = solve_scheduling(uav_b, env, hk_com_f, hk_rad_f, hc_f)
 
 energy_b = float(np.sum(uav_b.Pt) * uav_b.dt)
+print(f"\n  Final Radar Rate : {rates_b[-1]:.4f} bps/Hz")
+print(f"  Total Energy     : {energy_b:.2f} J")
 
-print(f"\n  📶 Final Radar Rate : {rates_b[-1]:.4f} bps/Hz")
-print(f"  ⚡ Total Energy     : {energy_b:.2f} J")
-print(f"  📊 Per-node service (bps/Hz):")
-for k in range(env.num_nodes):
-    flag = "⚠️ " if node_svc_b[k] < R_MIN else "  "
-    print(f"     Node {k+1:2d}: {node_svc_b[k]:.4f}  {flag}")
-print(f"  🎯 Nodes ≥ R_min={R_MIN}: "
-      f"{int(np.sum(node_svc_b >= R_MIN))}/{env.num_nodes}")
-
-# ── Baseline original plots (output_plots/) ────────────────────────────────
-print("\n  📊 Generating baseline paper-style plots...")
-plot_3d_trajectory(initial_position_b, uav_b.position, env, omega=omega_final_b)
-plot_top_view(initial_position_b, uav_b.position, env, omega=omega_final_b)
-plot_convergence(rates_b)
-plot_scheduling(omega_final_b, b_final_b, env)
-plot_altitude(initial_position_b, uav_b.position)
-plot_speed(initial_velocity_b, uav_b.velocity)
-plot_power(uav_b, omega_final_b, b_final_b)
-plot_dashboard(initial_position_b, uav_b.position, uav_b, env,
-               rates_b, omega_final_b, b_final_b)
+print("\n  Generating baseline individual plots...")
+generate_individual_plots(
+    "output_plots_baseline", "Baseline",
+    init_pos_b, uav_b.position,
+    init_vel_b, uav_b.velocity,
+    uav_b, env, rates_b, omega_b, b_b)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# SECTION 3 — IMPROVED (fairness + Pareto multi-objective)
-# ═════════════════════════════════════════════════════════════════════════════
-print("\n" + "─" * 65)
-# λ = 1.0 → pure radar maximisation (best rate, same energy as baseline)
-# λ < 1.0 → Pareto trade-off: lower energy at some rate cost
-# λ = 0.8 gives a good balance: ~16% energy saving with modest rate reduction
-LAM = 0.8
-
-print(f"  ② IMPROVED  —  Fairness (R_min={R_MIN}) + Pareto (λ={LAM})")
-print("─" * 65)
+# =============================================================================
+# SECTION 3 — IMPROVED (fairness + multi-objective)
+# =============================================================================
+print("\n" + "-" * 65)
+print(f"  IMPROVED  -  Fairness (R_min={R_MIN}) + Pareto (lam={LAM})")
+print("-" * 65)
 
 uav_i = UAV(Q=200, T=100.0)
 uav_i.initialize_trajectory(env)
-initial_position_i = uav_i.position.copy()
-initial_velocity_i = uav_i.velocity.copy()
+init_pos_i = uav_i.position.copy()
+init_vel_i = uav_i.velocity.copy()
 
-rates_i    = []
-energies_i = []
-prev_comp  = -np.inf
+rates_i = []
+omega_i = b_i = ns_i = None
+prev_comp = -np.inf
 
 print()
 for i in range(20):
     hk_com, hk_rad, hc, _, _ = _channel_gains_imp(uav_i, env)
-    omega_i, b_i, Rrad, Rcom, Rc, ns = solve_scheduling_fair(
+    omega_i, b_i, Rrad, Rcom, Rc, ns_i = solve_scheduling_fair(
         uav_i, env, hk_com, hk_rad, hc, R_min=R_MIN)
     solve_power_multiobjective(uav_i, env, omega_i, b_i, hk_com, hk_rad, hc,
                                lam=LAM, max_iter=30)
-    solve_trajectory(uav_i, env, omega_i, b_i, node_service=ns, R_min=R_MIN)
+    solve_trajectory(uav_i, env, omega_i, b_i, node_service=ns_i, R_min=R_MIN)
 
     rate_i   = compute_rate_improved(uav_i, env, omega_i)
     energy_i = compute_energy(uav_i)
     rates_i.append(rate_i)
-    energies_i.append(energy_i)
 
-    fair = int(np.sum(ns >= R_MIN))
+    fair = int(np.sum(ns_i >= R_MIN))
     print(f"  Iter {i+1:2d}  |  Radar: {rate_i:8.4f} bps/Hz"
           f"  |  Energy: {energy_i:7.2f} J"
           f"  |  Fair nodes: {fair}/{env.num_nodes}")
 
-    # Converge on the scalarised composite (rate + energy), not rate alone
-    e_scale  = uav_i.Q * uav_i.P_AVG * uav_i.dt
+    e_scale = uav_i.Q * uav_i.P_AVG * uav_i.dt
     composite = LAM * rate_i - (1 - LAM) * (energy_i / (e_scale + 1e-12))
     if abs(composite - prev_comp) < 1e-3 and i > 1:
-        print(f"  ✅ Converged at iteration {i+1}")
+        print(f"  Converged at iteration {i+1}")
         break
     prev_comp = composite
 
-node_svc_i = compute_per_node_rate(uav_i, env, omega_i)
-energy_i_final = energies_i[-1]
+energy_i_final = compute_energy(uav_i)
+print(f"\n  Final Radar Rate : {rates_i[-1]:.4f} bps/Hz")
+print(f"  Total Energy     : {energy_i_final:.2f} J")
 
-print(f"\n  📶 Final Radar Rate : {rates_i[-1]:.4f} bps/Hz")
-print(f"  ⚡ Total Energy     : {energy_i_final:.2f} J")
-print(f"  📊 Per-node service (bps/Hz):")
-for k in range(env.num_nodes):
-    flag = "✅" if node_svc_i[k] >= R_MIN else "⚠️ "
-    print(f"     Node {k+1:2d}: {node_svc_i[k]:.4f}  {flag}")
-print(f"  🎯 Nodes ≥ R_min={R_MIN}: "
-      f"{int(np.sum(node_svc_i >= R_MIN))}/{env.num_nodes}")
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# SECTION 4 — Pareto front sweep  (λ from 1 → 0.2)
-# ═════════════════════════════════════════════════════════════════════════════
-print("\n" + "─" * 65)
-print("  ③ PARETO FRONT  —  Sweeping λ (radar rate vs. energy trade-off)")
-print("─" * 65)
-print("  λ=1.0 → pure radar maximisation")
-print("  λ=0.0 → pure energy minimisation")
-print()
-
-lam_vals = [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2]
-pareto_r = []
-pareto_e = []
-
-for lam in lam_vals:
-    env_p = Environment(num_nodes=12, area_size=1200, seed=42)
-    uav_p = UAV(Q=200, T=100.0)
-    uav_p.initialize_trajectory(env_p)
-    prev_p = -np.inf
-    r_p = e_p = 0.0
-    om_p = b_p = ns_p = None
-    for it in range(20):
-        hk_com, hk_rad, hc, _, _ = _channel_gains_imp(uav_p, env_p)
-        om_p, b_p, _, _, _, ns_p = solve_scheduling_fair(
-            uav_p, env_p, hk_com, hk_rad, hc, R_min=R_MIN)
-        solve_power_multiobjective(
-            uav_p, env_p, om_p, b_p, hk_com, hk_rad, hc, lam=lam, max_iter=30)
-        solve_trajectory(uav_p, env_p, om_p, b_p, node_service=ns_p, R_min=R_MIN)
-        r_p = compute_rate_improved(uav_p, env_p, om_p)
-        e_p = compute_energy(uav_p)
-        esc = uav_p.Q * uav_p.P_AVG * uav_p.dt
-        c_p = lam * r_p - (1 - lam) * (e_p / (esc + 1e-12))
-        if abs(c_p - prev_p) < 1e-3 and it > 2:
-            break
-        prev_p = c_p
-    pareto_r.append(r_p)
-    pareto_e.append(e_p)
-    print(f"  λ={lam:.1f}  →  R={r_p:.4f} bps/Hz  E={e_p:.2f} J  (iters={it+1})")
-
-pareto_r = np.array(pareto_r)
-pareto_e = np.array(pareto_e)
+print("\n  Generating improved individual plots...")
+generate_individual_plots(
+    "output_plots_improved", "Improved",
+    init_pos_i, uav_i.position,
+    init_vel_i, uav_i.velocity,
+    uav_i, env, rates_i, omega_i, b_i)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# SECTION 5 — Final summary
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# SECTION 4 — Comparison plots  (4 figures, paper-style)
+# =============================================================================
+print("\n" + "-" * 65)
+print("  COMPARISON PLOTS")
+print("-" * 65)
+
+Q = uav_b.Q
+t = np.linspace(0, uav_b.T, Q)
+
+
+# ── Fig 1: Convergence comparison  (like Fig. 7 / 12 of paper) ───────────────
+fig, ax = plt.subplots(figsize=(9, 5))
+ax.plot(range(1, len(rates_b) + 1), rates_b,
+        color=C_BLUE, lw=2.5, marker="o", ms=6,
+        label="Baseline (single-obj, no fairness)")
+ax.plot(range(1, len(rates_i) + 1), rates_i,
+        color=C_GREEN, lw=2.5, marker="s", ms=6, ls="--",
+        label=f"Improved (lam={LAM}, R_min={R_MIN})")
+ax.set_xlabel("Number of Iterations", fontsize=13)
+ax.set_ylabel("Sum Radar Estimation Rate (bps/Hz)", fontsize=13)
+ax.set_title("Convergence Comparison: Baseline vs. Improved", fontsize=14)
+ax.legend(fontsize=11); ax.grid(True, alpha=0.3)
+fig.tight_layout()
+path = "output_plots_comparison/fig1_convergence_comparison.png"
+fig.savefig(path, dpi=150)
+plt.close(fig)
+print(f"   Saved -> {path}")
+
+
+# ── Fig 2: Power allocation comparison  (like Fig. 8 of paper) ───────────────
+fig, axes = plt.subplots(2, 2, figsize=(14, 8), sharex=True)
+fig.suptitle("Power Allocation: Baseline vs. Improved",
+             fontsize=14, fontweight="bold")
+
+# Top-left: Baseline stacked power bar
+axes[0, 0].bar(range(Q), uav_b.Pcom, label="P_com", color=C_BLUE,  width=1.0)
+axes[0, 0].bar(range(Q), uav_b.Prad, bottom=uav_b.Pcom,
+               label="P_rad", color=C_RED, width=1.0)
+axes[0, 0].set_ylabel("Power (W)", fontsize=11)
+axes[0, 0].set_title("Baseline – Power Split (P_com / P_rad)", fontsize=12)
+axes[0, 0].legend(fontsize=9); axes[0, 0].grid(axis="y", alpha=0.4)
+
+# Top-right: Improved stacked power bar
+axes[0, 1].bar(range(Q), uav_i.Pcom, label="P_com", color=C_BLUE,  width=1.0, alpha=0.85)
+axes[0, 1].bar(range(Q), uav_i.Prad, bottom=uav_i.Pcom,
+               label="P_rad", color=C_RED, width=1.0, alpha=0.85)
+axes[0, 1].set_ylabel("Power (W)", fontsize=11)
+axes[0, 1].set_title("Improved – Power Split (P_com / P_rad)", fontsize=12)
+axes[0, 1].legend(fontsize=9); axes[0, 1].grid(axis="y", alpha=0.4)
+
+# Bottom-left: Baseline alpha
+axes[1, 0].plot(t, uav_b.alpha, color=C_BLUE, lw=1.5, label="Baseline alpha")
+axes[1, 0].axhline(0.5, color="grey", ls="--", lw=0.8)
+axes[1, 0].set_xlabel("Time (s)", fontsize=11); axes[1, 0].set_ylabel("alpha", fontsize=11)
+axes[1, 0].set_ylim(0, 1)
+axes[1, 0].set_title("Baseline – Power Split Factor alpha", fontsize=12)
+axes[1, 0].legend(fontsize=9); axes[1, 0].grid(True, alpha=0.4)
+
+# Bottom-right: both alpha overlaid
+axes[1, 1].plot(t, uav_b.alpha, color=C_BLUE,  lw=1.5,       label="Baseline alpha")
+axes[1, 1].plot(t, uav_i.alpha, color=C_GREEN, lw=1.5, ls="--", label="Improved alpha")
+axes[1, 1].axhline(0.5, color="grey", ls="--", lw=0.8)
+axes[1, 1].set_xlabel("Time (s)", fontsize=11); axes[1, 1].set_ylabel("alpha", fontsize=11)
+axes[1, 1].set_ylim(0, 1)
+axes[1, 1].set_title("alpha Comparison (Baseline vs. Improved)", fontsize=12)
+axes[1, 1].legend(fontsize=9); axes[1, 1].grid(True, alpha=0.4)
+
+fig.tight_layout()
+path = "output_plots_comparison/fig2_power_comparison.png"
+fig.savefig(path, dpi=150)
+plt.close(fig)
+print(f"   Saved -> {path}")
+
+
+# ── Fig 3: Task scheduling comparison  (like Fig. 4 of paper) ────────────────
+fig, axes = plt.subplots(2, 1, figsize=(14, 8))
+fig.suptitle("UAV Task Scheduling: Baseline vs. Improved",
+             fontsize=14, fontweight="bold")
+_draw_scheduling(axes[0], omega_b, b_b, env,
+                 title="Baseline – UAV Task Scheduling per Time Slot")
+_draw_scheduling(axes[1], omega_i, b_i, env,
+                 title="Improved – UAV Task Scheduling per Time Slot")
+fig.tight_layout()
+path = "output_plots_comparison/fig3_task_scheduling_comparison.png"
+fig.savefig(path, dpi=150, bbox_inches="tight")
+plt.close(fig)
+print(f"   Saved -> {path}")
+
+
+# ── Fig 4: Trajectory comparison  (like Fig. 3 of paper) ─────────────────────
+fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+fig.suptitle("UAV Top-View Trajectory: Baseline vs. Improved",
+             fontsize=14, fontweight="bold")
+_draw_top_view(axes[0], init_pos_b, uav_b.position, env, omega_b,
+               title="Baseline – Top-View Trajectory")
+_draw_top_view(axes[1], init_pos_i, uav_i.position, env, omega_i,
+               title="Improved – Top-View Trajectory")
+fig.tight_layout()
+path = "output_plots_comparison/fig4_trajectory_comparison.png"
+fig.savefig(path, dpi=150, bbox_inches="tight")
+plt.close(fig)
+print(f"   Saved -> {path}")
+
+
+# =============================================================================
+# SECTION 5 — Summary
+# =============================================================================
+delta_rate   = rates_i[-1] - rates_b[-1]
+delta_energy = energy_i_final - energy_b
+
 print("\n" + "=" * 65)
 print("  FINAL COMPARISON SUMMARY")
 print("=" * 65)
-delta_rate   = rates_i[-1] - rates_b[-1]
-delta_energy = energy_i_final - energy_b
-jain_b      = jain_index(node_svc_b, include_zeros=True)   # honest: all 12 nodes
-jain_i      = jain_index(node_svc_i, include_zeros=True)   # honest: all 12 nodes
-jain_b_old  = jain_index(node_svc_b, include_zeros=False)  # legacy: served only
-jain_i_old  = jain_index(node_svc_i, include_zeros=False)  # legacy: served only
-n_fair_b = int(np.sum(node_svc_b >= R_MIN))
-n_fair_i = int(np.sum(node_svc_i >= R_MIN))
-
-print(f"  Radar Rate   |  Baseline: {rates_b[-1]:.4f}   "
-      f"Improved: {rates_i[-1]:.4f}   Δ={delta_rate:+.4f} bps/Hz")
-print(f"  Energy       |  Baseline: {energy_b:.2f} J   "
-      f"Improved: {energy_i_final:.2f} J   Δ={delta_energy:+.2f} J")
-print(f"  Fair Nodes   |  Baseline: {n_fair_b}/{env.num_nodes}          "
-      f"Improved: {n_fair_i}/{env.num_nodes}")
-print(f"  Jain Index   |  Baseline: {jain_b:.4f}    "
-      f"Improved: {jain_i:.4f}    Δ={jain_i - jain_b:+.4f}  (all nodes)")
-print(f"  Jain (srv'd) |  Baseline: {jain_b_old:.4f}    "
-      f"Improved: {jain_i_old:.4f}    Δ={jain_i_old - jain_b_old:+.4f}  (served nodes only)")
+print(f"  Radar Rate  |  Baseline: {rates_b[-1]:.4f}  "
+      f"Improved: {rates_i[-1]:.4f}  delta={delta_rate:+.4f} bps/Hz")
+print(f"  Energy      |  Baseline: {energy_b:.2f} J  "
+      f"Improved: {energy_i_final:.2f} J  delta={delta_energy:+.2f} J")
 print("=" * 65)
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# SECTION 6 — Comparison plots
-# ═════════════════════════════════════════════════════════════════════════════
-print("\n  📊 Generating comparison plots...")
-
-BLUE   = "#1565C0"
-GREEN  = "#2E7D32"
-RED    = "#C62828"
-
-# ── Fig 1: Convergence ───────────────────────────────────────────────────────
-fig, ax = plt.subplots(figsize=(9, 5))
-ax.plot(range(1, len(rates_b) + 1), rates_b, color=BLUE, lw=2.5,
-        marker="o", ms=6, label="Baseline (single-obj, no fairness)")
-ax.plot(range(1, len(rates_i) + 1), rates_i, color=GREEN, lw=2.5,
-        marker="s", ms=6, ls="--", label=f"Improved (λ=0.8, R_min={R_MIN})")
-ax.set_xlabel("Outer Iteration", fontsize=13)
-ax.set_ylabel("Sum Radar Estimation Rate (bps/Hz)", fontsize=13)
-ax.set_title("Convergence: Baseline vs. Improved", fontsize=14)
-ax.legend(fontsize=11); ax.grid(True, alpha=0.3)
-fig.tight_layout()
-fig.savefig("output_plots_comparison/fig1_convergence_comparison.png", dpi=150)
-plt.close(fig)
-
-# ── Fig 2: Per-node service ──────────────────────────────────────────────────
-K = env.num_nodes
-fig, ax = plt.subplots(figsize=(12, 6))
-x = np.arange(1, K + 1)
-w = 0.38
-bars_b = ax.bar(x - w / 2, node_svc_b, w, color=BLUE, alpha=0.80,
-                edgecolor="black", lw=0.8, label="Baseline")
-bars_i = ax.bar(x + w / 2, node_svc_i, w, color=GREEN, alpha=0.80,
-                edgecolor="black", lw=0.8, label="Improved (fairness)")
-# Highlight baseline nodes below R_min in red
-for k in range(K):
-    if node_svc_b[k] < R_MIN:
-        ax.bar(k + 1 - w / 2, node_svc_b[k], w, color=RED, alpha=0.85,
-               edgecolor="black", lw=0.8)
-ax.axhline(R_MIN, color=RED, ls="--", lw=1.8, label=f"R_min = {R_MIN} bps/Hz")
-ax.set_xlabel("Node Index", fontsize=13)
-ax.set_ylabel("Total Radar Service (bps/Hz)", fontsize=13)
-ax.set_title("Per-Node Radar Service: Baseline vs. Improved", fontsize=14)
-ax.set_xticks(x); ax.legend(fontsize=11); ax.grid(True, axis="y", alpha=0.3)
-n_below_b = int(np.sum(node_svc_b < R_MIN))
-n_below_i = int(np.sum(node_svc_i < R_MIN))
-ax.text(0.02, 0.96,
-        f"Nodes below R_min — Baseline: {n_below_b}   Improved: {n_below_i}",
-        transform=ax.transAxes, fontsize=10, va="top",
-        bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.8))
-fig.tight_layout()
-fig.savefig("output_plots_comparison/fig2_per_node_service.png", dpi=150)
-plt.close(fig)
-
-# ── Fig 3: Fairness metrics ──────────────────────────────────────────────────
-fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-ax = axes[0]
-bars = ax.bar(["Baseline", "Improved"], [jain_b, jain_i],
-              color=[BLUE, GREEN], edgecolor="black", alpha=0.85, width=0.4)
-ax.set_ylim(0, 1.1)
-ax.axhline(1.0, color="gray", ls=":", lw=1.5, label="Perfect fairness")
-for bar, val in zip(bars, [jain_b, jain_i]):
-    ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.02,
-            f"{val:.4f}", ha="center", fontsize=12, fontweight="bold")
-ax.set_ylabel("Jain's Fairness Index", fontsize=12)
-ax.set_title("Jain's Fairness Index\n(higher = fairer)", fontsize=12)
-ax.legend(fontsize=10); ax.grid(True, axis="y", alpha=0.3)
-
-ax = axes[1]
-labels = ["Min", "Mean", "Max"]
-stats_b = [node_svc_b.min(), node_svc_b.mean(), node_svc_b.max()]
-stats_i = [node_svc_i.min(), node_svc_i.mean(), node_svc_i.max()]
-x2 = np.arange(len(labels)); w2 = 0.35
-ax.bar(x2 - w2 / 2, stats_b, w2, color=BLUE, alpha=0.85, edgecolor="black",
-       label="Baseline")
-ax.bar(x2 + w2 / 2, stats_i, w2, color=GREEN, alpha=0.85, edgecolor="black",
-       label="Improved")
-ax.axhline(R_MIN, color=RED, ls="--", lw=1.8, label=f"R_min={R_MIN}")
-ax.set_xticks(x2); ax.set_xticklabels(labels, fontsize=12)
-ax.set_ylabel("Radar Service (bps/Hz)", fontsize=12)
-ax.set_title("Node Service Statistics\n(min / mean / max)", fontsize=12)
-ax.legend(fontsize=10); ax.grid(True, axis="y", alpha=0.3)
-fig.suptitle("Fairness Metrics: Baseline vs. Improved", fontsize=14, y=1.02)
-fig.tight_layout()
-fig.savefig("output_plots_comparison/fig3_fairness_metrics.png", dpi=150,
-            bbox_inches="tight")
-plt.close(fig)
-
-# ── Fig 4: Pareto front ──────────────────────────────────────────────────────
-fig, ax = plt.subplots(figsize=(9, 6))
-sc = ax.scatter(pareto_e, pareto_r, c=lam_vals, cmap="plasma",
-                s=140, zorder=5, edgecolors="black", lw=0.8)
-ax.plot(pareto_e, pareto_r, "k--", lw=1.2, alpha=0.5, zorder=4)
-for lv, en, ra in zip(lam_vals, pareto_e, pareto_r):
-    ax.annotate(f"λ={lv:.1f}", (en, ra),
-                textcoords="offset points", xytext=(6, 4), fontsize=8.5)
-ax.scatter([energy_b], [rates_b[-1]], marker="*", s=280, color=RED, zorder=6,
-           label=f"Baseline (no fairness)\nR={rates_b[-1]:.3f}, E={energy_b:.1f} J")
-plt.colorbar(sc, ax=ax, label="Pareto Weight λ")
-ax.set_xlabel("Total Energy Consumption (J)", fontsize=13)
-ax.set_ylabel("Sum Radar Estimation Rate (bps/Hz)", fontsize=13)
-ax.set_title("Pareto Front: Radar Rate vs. Energy\n(with Fairness Constraint Active)",
-             fontsize=13)
-ax.legend(fontsize=10); ax.grid(True, alpha=0.3)
-fig.tight_layout()
-fig.savefig("output_plots_comparison/fig4_pareto_front.png", dpi=150)
-plt.close(fig)
-
-# ── Fig 5: Power profile comparison ─────────────────────────────────────────
-Q = uav_b.Q
-t = np.linspace(0, uav_b.T, Q)
-fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
-axes[0].plot(t, uav_b.Pt, color=BLUE, lw=1.5, alpha=0.85, label="Baseline Pt")
-axes[0].plot(t, uav_i.Pt, color=GREEN, lw=1.5, alpha=0.85, ls="--",
-             label="Improved Pt")
-axes[0].set_ylabel("Total Transmit Power (W)", fontsize=12)
-axes[0].set_title("Power Allocation: Baseline vs. Improved", fontsize=13)
-axes[0].legend(fontsize=10); axes[0].grid(True, alpha=0.3)
-axes[1].plot(t, uav_b.alpha, color=BLUE, lw=1.5, alpha=0.85,
-             label="Baseline α (comm fraction)")
-axes[1].plot(t, uav_i.alpha, color=GREEN, lw=1.5, alpha=0.85, ls="--",
-             label="Improved α (comm fraction)")
-axes[1].set_xlabel("Time (s)", fontsize=12)
-axes[1].set_ylabel("Power Split α", fontsize=12)
-axes[1].set_ylim(0, 1)
-axes[1].legend(fontsize=10); axes[1].grid(True, alpha=0.3)
-fig.tight_layout()
-fig.savefig("output_plots_comparison/fig5_power_comparison.png", dpi=150)
-plt.close(fig)
-
-# ── Fig 6: Full dashboard ────────────────────────────────────────────────────
-fig = plt.figure(figsize=(16, 10))
-gs  = gridspec.GridSpec(2, 3, figure=fig, hspace=0.40, wspace=0.35)
-
-ax = fig.add_subplot(gs[0, 0])
-ax.plot(range(1, len(rates_b) + 1), rates_b, color=BLUE, lw=2,
-        marker="o", ms=4, label="Baseline")
-ax.plot(range(1, len(rates_i) + 1), rates_i, color=GREEN, lw=2,
-        marker="s", ms=4, ls="--", label="Improved")
-ax.set_xlabel("Iteration", fontsize=10); ax.set_ylabel("Radar Rate (bps/Hz)", fontsize=10)
-ax.set_title("Convergence", fontsize=11); ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
-
-ax = fig.add_subplot(gs[0, 1])
-xp = np.arange(1, K + 1)
-ax.bar(xp - 0.2, node_svc_b, 0.38, color=BLUE, alpha=0.80,
-       edgecolor="black", lw=0.6, label="Baseline")
-ax.bar(xp + 0.2, node_svc_i, 0.38, color=GREEN, alpha=0.80,
-       edgecolor="black", lw=0.6, label="Improved")
-ax.axhline(R_MIN, color=RED, ls="--", lw=1.5, label=f"R_min={R_MIN}")
-ax.set_xlabel("Node", fontsize=10); ax.set_ylabel("Service (bps/Hz)", fontsize=10)
-ax.set_title("Per-Node Service", fontsize=11)
-ax.set_xticks(xp); ax.tick_params(axis="x", labelsize=7)
-ax.legend(fontsize=8); ax.grid(True, axis="y", alpha=0.3)
-
-ax = fig.add_subplot(gs[0, 2])
-brs = ax.bar(["Baseline", "Improved"], [jain_b, jain_i],
-             color=[BLUE, GREEN], edgecolor="black", alpha=0.85, width=0.4)
-for bar, val in zip(brs, [jain_b, jain_i]):
-    ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
-            f"{val:.4f}", ha="center", fontsize=11, fontweight="bold")
-ax.set_ylim(0, 1.1); ax.set_ylabel("Jain's Fairness Index", fontsize=10)
-ax.set_title("Fairness Index", fontsize=11); ax.grid(True, axis="y", alpha=0.3)
-
-ax = fig.add_subplot(gs[1, 0])
-sc2 = ax.scatter(pareto_e, pareto_r, c=lam_vals, cmap="plasma",
-                 s=80, zorder=5, edgecolors="black", lw=0.6)
-ax.plot(pareto_e, pareto_r, "k--", lw=1, alpha=0.5, zorder=4)
-ax.scatter([energy_b], [rates_b[-1]], marker="*", s=200,
-           color=RED, zorder=6, label="Baseline")
-plt.colorbar(sc2, ax=ax, label="λ")
-ax.set_xlabel("Energy (J)", fontsize=10); ax.set_ylabel("Radar Rate (bps/Hz)", fontsize=10)
-ax.set_title("Pareto Front", fontsize=11); ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
-
-ax = fig.add_subplot(gs[1, 1])
-brs2 = ax.bar(["Baseline", "Improved"], [energy_b, energy_i_final],
-              color=[BLUE, GREEN], edgecolor="black", alpha=0.85, width=0.4)
-for bar, val in zip(brs2, [energy_b, energy_i_final]):
-    ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.3,
-            f"{val:.2f} J", ha="center", fontsize=11, fontweight="bold")
-ax.set_ylabel("Total Energy (J)", fontsize=10)
-ax.set_title("Energy Consumption", fontsize=11); ax.grid(True, axis="y", alpha=0.3)
-
-ax = fig.add_subplot(gs[1, 2])
-ax.axis("off")
-summary_text = (
-    f"{'SUMMARY':^30}\n"
-    f"{'─'*30}\n\n"
-    f"  Radar Rate\n"
-    f"    Baseline : {rates_b[-1]:.4f} bps/Hz\n"
-    f"    Improved : {rates_i[-1]:.4f} bps/Hz\n"
-    f"    Δ        : {delta_rate:+.4f} bps/Hz\n\n"
-    f"  Energy\n"
-    f"    Baseline : {energy_b:.2f} J\n"
-    f"    Improved : {energy_i_final:.2f} J\n"
-    f"    Δ        : {delta_energy:+.2f} J\n\n"
-    f"  Fairness (R_min={R_MIN})\n"
-    f"    Baseline : {n_fair_b}/{K} nodes\n"
-    f"    Improved : {n_fair_i}/{K} nodes\n\n"
-    f"  Jain (all nodes)\n"
-    f"    Baseline : {jain_b:.4f}\n"
-    f"    Improved : {jain_i:.4f}\n"
-    f"    Δ        : {jain_i - jain_b:+.4f}\n\n"
-    f"  Jain (served only)\n"
-    f"    Baseline : {jain_b_old:.4f}\n"
-    f"    Improved : {jain_i_old:.4f}\n"
-    f"    Δ        : {jain_i_old - jain_b_old:+.4f}"
-)
-ax.text(0.05, 0.95, summary_text, transform=ax.transAxes,
-        fontsize=10, va="top", fontfamily="monospace",
-        bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.9))
-
-fig.suptitle(
-    "UAV-ISAC: Baseline vs. Improved — Full Comparison Dashboard",
-    fontsize=14, fontweight="bold", y=1.01)
-fig.savefig("output_plots_comparison/fig6_dashboard.png",
-            dpi=150, bbox_inches="tight")
-plt.close(fig)
-
-print("   💾  Saved → output_plots_comparison/fig1_convergence_comparison.png")
-print("   💾  Saved → output_plots_comparison/fig2_per_node_service.png")
-print("   💾  Saved → output_plots_comparison/fig3_fairness_metrics.png")
-print("   💾  Saved → output_plots_comparison/fig4_pareto_front.png")
-print("   💾  Saved → output_plots_comparison/fig5_power_comparison.png")
-print("   💾  Saved → output_plots_comparison/fig6_dashboard.png")
-
 print()
-print("✅ Simulation complete!")
-print("   output_plots/            ← baseline paper-style plots")
-print("   output_plots_comparison/ ← baseline vs improved comparison plots")
+print("Simulation complete!")
+print("   output_plots_baseline/   <- baseline individual plots (8 files)")
+print("   output_plots_improved/   <- improved individual plots (8 files)")
+print("   output_plots_comparison/ <- 4 comparison figures")
 print("=" * 65)
