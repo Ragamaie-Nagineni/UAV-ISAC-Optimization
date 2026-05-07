@@ -22,6 +22,7 @@ even when unnecessary.
 ---
 
 ## 🧾 Project Structure
+```text
 ├── Reference_researchpaper/        # Reference paper and related literature
 ├── output_plots/                   # General output figures
 ├── output_plots_baseline/          # Baseline algorithm plots
@@ -37,6 +38,8 @@ even when unnecessary.
 ├── utils.py                        # Helper functions and utilities
 ├── visualization.py                # Plot generation and visualisation
 ├── uav_isac_paper(3).pdf           # Paper for optimized algorithm
+└── README.md
+```
 └── README.md
 
 ---
