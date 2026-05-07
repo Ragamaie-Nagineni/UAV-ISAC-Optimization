@@ -22,7 +22,22 @@ even when unnecessary.
 ---
 
 ## 🧾 Project Structure
-
+├── Reference_researchpaper/        # Reference paper and related literature
+├── output_plots/                   # General output figures
+├── output_plots_baseline/          # Baseline algorithm plots
+├── output_plots_comparison/        # Side-by-side comparison plots
+├── output_plots_improved/          # Improved algorithm plots
+├── environment.py                  # Environment setup and configuration
+├── main.py                         # Main simulation entry point
+├── optimization_baseline.py        # Baseline SCA optimisation (Liu et al.)
+├── optimization_improved.py        # Improved multi-objective optimisation
+├── run_baseline.py                 # Script to run baseline algorithm
+├── run_improved.py                 # Script to run improved algorithm
+├── uav.py                          # UAV mobility and trajectory model
+├── utils.py                        # Helper functions and utilities
+├── visualization.py                # Plot generation and visualisation
+├── uav_isac_paper(3).pdf           # Paper for optimized algorithm
+└── README.md
 
 ---
 
@@ -193,14 +208,7 @@ $$\tilde{\xi}^{(i)}_{k,rad} = \xi^{(i)}_{k,rad} \cdot \left(1 + \gamma \max(R_{m
 
 ---
 
-## Future Work
 
-- Mobile IoT nodes with Kalman-filter position prediction
-- Multi-UAV coordination with distributed fairness constraints
-- Deep reinforcement learning sub-solvers for non-stationary channels
-- Joint waveform design for physical-layer security against eavesdroppers
-
----
 
 ## 📚 Reference
 
@@ -222,7 +230,7 @@ This project builds upon:
   year    = {2024}
 }
 ```
-
+Attached with  project in the folder named reference paper
 ---
 
 ## 👥 Contributors
