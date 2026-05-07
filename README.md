@@ -40,7 +40,6 @@ even when unnecessary.
 ├── uav_isac_paper(3).pdf           # Paper for optimized algorithm
 └── README.md
 ```
-└── README.md
 
 ---
 
