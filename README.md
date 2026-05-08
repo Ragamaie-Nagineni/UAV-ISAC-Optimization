@@ -257,7 +257,7 @@ This project is open-source and distributed under the [MIT License](LICENSE).
 ## 🤝 Contribution
 
 Contributions, issues, and feature requests are welcome!
-Feel free to check the [issues page](https://github.com/Ragamaie-Nagineni/uav-isac-iot-optimiser/issues)
+Feel free to check the [issues page](https://github.com/Ragamaie-Nagineni/UAV-ISAC-Optimization/issues)
 or submit a pull request.
 
 ---
